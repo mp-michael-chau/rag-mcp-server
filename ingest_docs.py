@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import argparse
 import urllib.request
 import pypdfium2 as pdfium
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -10,20 +11,20 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 
-# 1. 系統設定
+# 1. System settings
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 COLLECTION_NAME = "shared_knowledge"
-DOCS_DIR = "./my_shared_docs" # 放入你想跨專案共享的檔案
-CONVERTED_DIR = "./converted_md" # Docling 轉出的 Markdown 快取（來源 PDF 未變更時直接重用）
-CONVERT_BATCH_PAGES = 40 # 每批轉換的頁數（限制記憶體用量，中斷後可從斷點續轉）
+DOCS_DIR = "./my_shared_docs" # Put the files you want to share across projects here
+CONVERTED_DIR = "./converted_md" # Markdown cache of Docling conversions (reused when the source PDF is unchanged)
+CONVERT_BATCH_PAGES = 40 # Pages per conversion batch (limits memory usage; resumable after interruption)
 OLLAMA_HOST = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"
 
-# 2. 初始化資料庫連線
+# 2. Initialize database connection
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-# 3. Docling PDF 轉換器（表格辨識用 ACCURATE 模式，較慢但表格重建品質較佳）
+# 3. Docling PDF converter (ACCURATE mode for table recognition: slower but better table reconstruction)
 pdf_pipeline = PdfPipelineOptions()
 pdf_pipeline.table_structure_options.mode = TableFormerMode.ACCURATE
 converter = DocumentConverter(
@@ -31,7 +32,7 @@ converter = DocumentConverter(
 )
 
 def embed_texts(texts):
-    """批次呼叫 Ollama embedding API"""
+    """Call the Ollama embedding API in batches"""
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/api/embed",
         data=json.dumps({"model": EMBED_MODEL, "input": texts}).encode(),
@@ -40,24 +41,27 @@ def embed_texts(texts):
     with urllib.request.urlopen(req) as resp:
         return json.load(resp)["embeddings"]
 
-# 4. 確保 Collection 存在（維度由 Ollama 模型實際輸出決定）
-if not qdrant.collection_exists(COLLECTION_NAME):
-    qdrant.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(
-            size=len(embed_texts(["dimension probe"])[0]),
-            distance=Distance.COSINE
+# 4. Ensure the collection exists (dimension determined by the actual Ollama model output)
+def ensure_collection():
+    if not qdrant.collection_exists(COLLECTION_NAME):
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=len(embed_texts(["dimension probe"])[0]),
+                distance=Distance.COSINE
+            )
         )
-    )
 
-# project_id payload index（冪等：已存在時 qdrant 回 409，直接忽略）
-try:
-    qdrant.create_payload_index(COLLECTION_NAME, field_name="project_id", field_schema="keyword")
-except Exception:
-    pass
+    # project_id payload index (idempotent: qdrant returns 409 if it already exists, which we ignore)
+    try:
+        qdrant.create_payload_index(COLLECTION_NAME, field_name="project_id", field_schema="keyword")
+    except Exception:
+        pass
 
-# 5. 文本切塊設定：先依 Markdown 標題層級（H1-H3）切分並組父標題麵包屑，再對各節做長度切塊
-# 依照 Markdown 標題層級切割，並自動將父標題注入 Payload/Text
+# 5. Text chunking settings: Parent-Child (Small-to-Big) architecture
+#    Parent = complete large section (stored in each Child's payload["text"] and returned directly at retrieval time, preserving full context)
+#    Child  = small chunk (only Children are vectorized, for precise semantic matching)
+#    First split into Parents by Markdown header levels (H1-H3) with parent header breadcrumbs, then split overly long sections by length
 headers_to_split_on = [
     ("#", "Header 1"),
     ("##", "Header 2"),
@@ -69,23 +73,30 @@ header_splitter = MarkdownHeaderTextSplitter(
     strip_headers=True,
 )
 
-# 各節內仍需控制長度 (避免單个文本超過 LLM 或 Embedding 模型上限)
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,
-    chunk_overlap=200,
+# Parent: covers a complete section, no overlap needed
+parent_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=2000,
+    chunk_overlap=0,
     separators=["\n\n", "\n", " ", ""]
 )
 
-def split_with_headers(content):
-    """回傳 (父標題麵包屑, 切塊文字) 清單；無標題的內容麵包屑為空字串"""
+# Child: sized for the embedding model, focused on precise semantic matching
+child_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=300,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", " ", ""]
+)
+
+def split_parents_with_headers(content):
+    """Return a list of (parent header breadcrumb, parent chunk text); content without headers gets an empty breadcrumb"""
     results = []
     for section in header_splitter.split_text(content):
         breadcrumb = " > ".join(
             section.metadata[key] for _, key in headers_to_split_on
             if section.metadata.get(key)
         )
-        for chunk in text_splitter.split_text(section.page_content):
-            results.append((breadcrumb, chunk))
+        for parent_text in parent_splitter.split_text(section.page_content):
+            results.append((breadcrumb, parent_text))
     return results
 
 def get_pdf_page_count(filepath):
@@ -96,20 +107,20 @@ def get_pdf_page_count(filepath):
         pdf.close()
 
 def convert_pdf_to_markdown(filepath, project_id):
-    """以 Docling 分批將 PDF 轉為 Markdown、逐批寫入快取；中斷後重跑會自動從斷點續轉"""
+    """Convert PDF to Markdown with Docling in batches, writing each batch to the cache; rerunning after interruption resumes from the breakpoint"""
     os.makedirs(CONVERTED_DIR, exist_ok=True)
-    # 快取檔名加 project_id 前綴，防跨專案同名 PDF 快取互蓋
+    # Cache filename is prefixed with project_id to prevent same-named PDFs across projects from overwriting each other's caches
     cache_path = os.path.join(CONVERTED_DIR, f"{project_id}__{os.path.basename(filepath)}.md")
     progress_path = cache_path + ".progress"
 
-    # 完整快取且來源 PDF 未變更 → 直接使用
+    # Full cache exists and source PDF is unchanged → use it directly
     if (os.path.exists(cache_path) and not os.path.exists(progress_path)
             and os.path.getmtime(cache_path) > os.path.getmtime(filepath)):
-        print(f"  使用現有轉換結果：{cache_path}")
+        print(f"  Using existing conversion result: {cache_path}")
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read()
 
-    # 來源 PDF 已變更 → 清除舊進度重轉
+    # Source PDF changed → remove old progress and reconvert
     if os.path.exists(cache_path) and os.path.getmtime(cache_path) < os.path.getmtime(filepath):
         os.remove(cache_path)
         if os.path.exists(progress_path):
@@ -120,7 +131,7 @@ def convert_pdf_to_markdown(filepath, project_id):
     if os.path.exists(progress_path):
         with open(progress_path, "r", encoding="utf-8") as pf:
             done_pages, done_bytes = (int(x) for x in pf.read().strip().split(","))
-    print(f"  Docling 轉換中（已完成 {done_pages}/{total_pages} 頁，每批 {CONVERT_BATCH_PAGES} 頁）")
+    print(f"  Converting with Docling ({done_pages}/{total_pages} pages done, {CONVERT_BATCH_PAGES} pages per batch)")
 
     with open(cache_path, "ab" if done_pages else "wb") as out:
         if done_pages:
@@ -134,7 +145,7 @@ def convert_pdf_to_markdown(filepath, project_id):
             out.flush()
             with open(progress_path, "w", encoding="utf-8") as pf:
                 pf.write(f"{end},{out.tell()}")
-            print(f"  已轉換 {end}/{total_pages} 頁")
+            print(f"  Converted {end}/{total_pages} pages")
             start = end + 1
 
     os.remove(progress_path)
@@ -144,7 +155,7 @@ def convert_pdf_to_markdown(filepath, project_id):
 def ingest_directory():
     points = []
 
-    # 雙層掃描：根目錄檔案 = global；一級子資料夾名即 project_id（跳過 . 開頭資料夾，不遞迴更深層）
+    # Two-level scan: root-level files = global; first-level subfolder names are project_ids (skip folders starting with . and don't recurse deeper)
     doc_sources = []
     for entry in sorted(os.listdir(DOCS_DIR)):
         entry_path = os.path.join(DOCS_DIR, entry)
@@ -160,11 +171,11 @@ def ingest_directory():
 
     for project_id, filename, filepath in doc_sources:
         if filename.endswith('.pdf'):
-            # 先以 Docling 轉成 Markdown，再進行後續切塊
+            # First convert PDF to Markdown with Docling, then proceed with chunking
             try:
                 content = convert_pdf_to_markdown(filepath, project_id)
             except Exception as e:
-                print(f"警告：{project_id}/{filename} Docling 轉換失敗（{e}），已跳過")
+                print(f"Warning: Docling conversion failed for {project_id}/{filename} ({e}); skipped")
                 continue
         elif filename.endswith(('.txt', '.md')):
             with open(filepath, 'r', encoding='utf-8') as f:
@@ -173,42 +184,54 @@ def ingest_directory():
             continue
 
         if not content.strip():
-            print(f"警告：{project_id}/{filename} 沒有提取到任何文字，可能是掃描式 PDF（需要 OCR）")
+            print(f"Warning: no text extracted from {project_id}/{filename}; it may be a scanned PDF (OCR required)")
             continue
 
-        print(f"處理中：{project_id}/{filename}")
+        print(f"Processing: {project_id}/{filename}")
 
-        # 進行文本切塊（父標題注入 text 與 payload）
-        chunks = split_with_headers(content)
+        # Parent-Child chunking: split Parents first (with breadcrumb prefix), then split each Parent into Children;
+        # only Children are vectorized; the full Parent text is stored in each Child's payload["text"]
+        entries = []
+        for p_idx, (breadcrumb, parent_text) in enumerate(split_parents_with_headers(content)):
+            parent_full = f"{breadcrumb}\n\n{parent_text}" if breadcrumb else parent_text
+            parent_id = f"{project_id}/{filename}#p{p_idx}"
+            for c_idx, child_text in enumerate(child_splitter.split_text(parent_text)):
+                entries.append({
+                    "breadcrumb": breadcrumb,
+                    "parent_id": parent_id,
+                    "p_idx": p_idx,
+                    "c_idx": c_idx,
+                    "parent_full": parent_full,
+                    "embed_src": f"{breadcrumb}\n\n{child_text}" if breadcrumb else child_text,
+                })
 
-        # 批次產生向量（Ollama /api/embed 支援多筆輸入；embedding 文字含父標題麵包屑）
+        # Generate vectors in batches (Ollama /api/embed supports multiple inputs; embedding text = breadcrumb + Child)
         EMBED_BATCH = 32
-        for start in range(0, len(chunks), EMBED_BATCH):
-            batch_chunks = chunks[start:start + EMBED_BATCH]
-            vectors = embed_texts(
-                [f"{breadcrumb}\n\n{chunk}" if breadcrumb else chunk
-                 for breadcrumb, chunk in batch_chunks]
-            )
+        for start in range(0, len(entries), EMBED_BATCH):
+            batch = entries[start:start + EMBED_BATCH]
+            vectors = embed_texts([entry["embed_src"] for entry in batch])
 
-            for j, ((breadcrumb, chunk), vector) in enumerate(zip(batch_chunks, vectors)):
-                i = start + j
-                # 建立 Qdrant 資料點（ID 由 專案+檔名+切塊編號 決定，重複執行時覆蓋而非重複插入）
+            for entry, vector in zip(batch, vectors):
+                # Create the Qdrant point (ID derived from project + filename + parent/child index; reruns overwrite instead of duplicating)
                 point = PointStruct(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{project_id}:{filename}:{i}")),
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{project_id}:{filename}:{entry['p_idx']}:{entry['c_idx']}")),
                     vector=vector,
                     payload={
                         "project_id": project_id,
                         "source": filename,
-                        "headers": breadcrumb,
-                        "chunk_index": i,
-                        "text": f"{breadcrumb}\n\n{chunk}" if breadcrumb else chunk
+                        "headers": entry["breadcrumb"],
+                        "parent_id": entry["parent_id"],
+                        "parent_index": entry["p_idx"],
+                        "child_index": entry["c_idx"],
+                        "child_text": entry["embed_src"],  # for Dashboard debugging
+                        "text": entry["parent_full"],  # full Parent content, returned directly at retrieval time
                     }
                 )
                 points.append(point)
 
     if points:
         print(f"Upserting {len(points)} chunks into Qdrant...")
-        # 分批上傳，避免單次請求超過 Qdrant 的 payload 上限 (32MB)
+        # Upload in batches to avoid exceeding Qdrant's single-request payload limit (32MB)
         BATCH_SIZE = 100
         for start in range(0, len(points), BATCH_SIZE):
             batch = points[start:start + BATCH_SIZE]
@@ -216,12 +239,24 @@ def ingest_directory():
                 collection_name=COLLECTION_NAME,
                 points=batch
             )
-            print(f"  已上傳 {min(start + BATCH_SIZE, len(points))}/{len(points)} chunks")
+            print(f"  Uploaded {min(start + BATCH_SIZE, len(points))}/{len(points)} chunks")
         print("Done!")
     else:
-        print("沒有找到可攝取的文件。")
+        print("No ingestible documents found.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ingest shared documents into Qdrant (Parent-Child chunking)")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Delete and recreate the collection (recommended after chunking format changes, to avoid leftover points in the old format)",
+    )
+    args = parser.parse_args()
+
     os.makedirs(DOCS_DIR, exist_ok=True)
-    print(f"請將共享文件放入 {DOCS_DIR}（一級子資料夾名即 project_id，根目錄檔案 = global）後，再次執行此腳本。")
+    if args.rebuild and qdrant.collection_exists(COLLECTION_NAME):
+        qdrant.delete_collection(COLLECTION_NAME)
+        print(f"Deleted old collection: {COLLECTION_NAME}")
+    ensure_collection()
+    print(f"Put shared documents into {DOCS_DIR} (first-level subfolder names are project_ids; root-level files = global), then run this script again.")
     ingest_directory()
