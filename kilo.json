@@ -1,0 +1,10 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "shared-rag": {
+      "type": "local",
+      "command": ["/Users/bellergy/Documents/Projects/local-mcp/rag/.venv/bin/python", "/Users/bellergy/Documents/Projects/local-mcp/rag/rag_mcp_server.py"],
+      "enabled": true
+    }
+  }
+}

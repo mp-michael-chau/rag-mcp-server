@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# RAG data & caches
+converted_md/
+qdrant_storage/
+my_shared_docs/
+
+# Environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
