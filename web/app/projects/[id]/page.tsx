@@ -167,7 +167,7 @@ export default function ProjectPage() {
   const [actionInfo, setActionInfo] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<DocumentItem | null>(null);
   const [approveOverwrite, setApproveOverwrite] = useState<{ name: string; andIngest: boolean } | null>(null);
-  const { active, isTargeted, refresh } = useJobs();
+  const { active, finished, isTargeted, refresh } = useJobs();
 
   const load = useCallback(async () => {
     try {
@@ -183,14 +183,24 @@ export default function ProjectPage() {
 
   useEffect(() => {
     queueMicrotask(() => void load());
-    const t = setInterval(() => void load(), 3000);
-    return () => clearInterval(t);
   }, [load]);
 
-  // refresh doc list right after jobs finish
+  // reload the file lists when a job targeting this project (or the whole
+  // library) reaches a terminal state; bursts collapse into one 250ms-debounced load
+  const handledTerminal = useRef<Set<string>>(new Set());
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (active.length === 0) queueMicrotask(() => void load());
-  }, [active.length, load]);
+    const fresh = finished.filter(
+      (j) => !handledTerminal.current.has(j.id) && (j.project_id === null || j.project_id === projectId),
+    );
+    if (fresh.length === 0) return;
+    for (const j of fresh) handledTerminal.current.add(j.id);
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    reloadTimer.current = setTimeout(() => void load(), 250);
+    return () => {
+      if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    };
+  }, [finished, load, projectId]);
 
   const enqueue = async (body: object) => {
     setActionError(null);

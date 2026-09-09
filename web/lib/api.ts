@@ -31,6 +31,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// SSE stream of job state changes. Direct to FastAPI (bypasses the Next.js
+// /api proxy, which may buffer streaming responses); the backend's CORS
+// middleware allows this origin and EventSource sends a simple GET (no preflight).
+export const EVENTS_URL = "http://127.0.0.1:8100/api/events";
+
 // --- types mirroring the FastAPI schemas ---
 
 export type Stage = "inbox" | "review" | "docs";

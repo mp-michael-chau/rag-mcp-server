@@ -1,13 +1,13 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { api, type Job } from "@/lib/api";
+import { api, EVENTS_URL, type Job } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 
 interface JobsContextValue {
-  /** queued + running jobs, polled live */
+  /** queued + running jobs, pushed live via SSE */
   active: Job[];
   /** recently finished jobs (done/error), kept briefly for toasts */
   finished: Job[];
@@ -33,41 +33,66 @@ export function useJobs(): JobsContextValue {
 export function JobsProvider({ children }: { children: React.ReactNode }) {
   const [active, setActive] = useState<Job[]>([]);
   const [finished, setFinished] = useState<Job[]>([]);
-  const seenIds = useRef<Set<string>>(new Set());
+  const hadError = useRef(false);
 
-  const poll = useCallback(async () => {
+  // Authoritative active-list fetch: seeds state on mount and reconciles after
+  // an SSE reconnect (a backend restart clears the in-memory registry — the
+  // refetch then correctly drops the dead jobs instead of leaving ghost cards).
+  const reconcile = useCallback(async () => {
     try {
       const data = await api<{ jobs: Job[] }>("/api/jobs?active=1");
-      const nowActive = data.jobs;
-
-      // fetch final state of jobs that vanished from the active list (finished or failed)
-      const goneIds = [...seenIds.current].filter((id) => !nowActive.some((a) => a.id === id));
-      setActive(nowActive);
-      seenIds.current = new Set(nowActive.map((j) => j.id));
-
-      for (const id of goneIds) {
-        try {
-          const final = await api<Job>(`/api/jobs/${id}`);
-          setFinished((prev) => [...prev.filter((p) => p.id !== final.id), final].slice(-10));
-        } catch {
-          // job pruned or server restarted; drop silently
-        }
-      }
-      setFinished((prev) => prev.filter((f) => Date.now() / 1000 - (f.finished_at ?? 0) < FINISHED_TTL_MS / 1000));
+      setActive(data.jobs);
     } catch {
       // backend down — badges elsewhere show it; keep last known state
     }
   }, []);
 
   const refresh = useCallback(() => {
-    void poll();
-  }, [poll]);
+    void reconcile();
+  }, [reconcile]);
 
   useEffect(() => {
-    queueMicrotask(() => void poll());
-    const t = setInterval(() => void poll(), 1000);
+    queueMicrotask(() => void reconcile());
+    const es = new EventSource(EVENTS_URL);
+    const onSnapshot = (e: Event) => {
+      const data = JSON.parse((e as MessageEvent).data as string) as { jobs: Job[] };
+      setActive(data.jobs);
+    };
+    const onJob = (e: Event) => {
+      const job = JSON.parse((e as MessageEvent).data as string) as Job;
+      if (job.status === "done" || job.status === "error") {
+        // terminal events carry the full final dict — no /api/jobs/{id} refetch needed
+        setActive((prev) => prev.filter((p) => p.id !== job.id));
+        setFinished((prev) => [...prev.filter((p) => p.id !== job.id), job].slice(-10));
+      } else {
+        setActive((prev) => [...prev.filter((p) => p.id !== job.id), job]);
+      }
+    };
+    es.addEventListener("snapshot", onSnapshot);
+    es.addEventListener("job", onJob);
+    es.onopen = () => {
+      if (hadError.current) {
+        hadError.current = false;
+        void reconcile();
+      }
+    };
+    es.onerror = () => {
+      hadError.current = true; // EventSource retries automatically; snapshot + refetch repair state
+    };
+    return () => {
+      es.close();
+    };
+  }, [reconcile]);
+
+  // expire finished toasts (local timer only — no network traffic)
+  useEffect(() => {
+    const t = setInterval(() => {
+      setFinished((prev) =>
+        prev.filter((f) => Date.now() / 1000 - (f.finished_at ?? 0) < FINISHED_TTL_MS / 1000),
+      );
+    }, 1000);
     return () => clearInterval(t);
-  }, [poll]);
+  }, []);
 
   const isTargeted = useCallback(
     (type: Job["type"], projectId: string, name: string) => {

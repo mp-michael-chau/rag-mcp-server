@@ -5,7 +5,11 @@ Run from the rag/ directory:  uvicorn api.app:app --port 8100
 job registry and its worker thread live in this process.)
 """
 
+import asyncio
+import functools
+import json
 import os
+import queue
 import re
 import shutil
 import sys
@@ -18,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -455,6 +460,40 @@ def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, f"Job not found: {job_id}")
     return job.to_dict()
+
+
+@app.get("/api/events")
+async def events():
+    """SSE stream of job state changes: a `snapshot` of active jobs on connect,
+    then one `job` event per queued/running/progress/terminal transition.
+
+    Each connection parks one default-executor thread on a blocking q.get with
+    a 15s timeout doubling as the heartbeat — fine for 1-2 local tabs. Upgrade
+    path if ever needed: asyncio.Queue + loop.call_soon_threadsafe from the
+    JobManager worker thread.
+    """
+    q = job_manager.subscribe()
+    loop = asyncio.get_running_loop()
+
+    async def gen():
+        try:
+            snap = {"type": "snapshot", "jobs": [j.to_dict() for j in job_manager.list(active_only=True)]}
+            yield f"event: snapshot\ndata: {json.dumps(snap)}\n\n"
+            while True:
+                try:
+                    job = await loop.run_in_executor(None, functools.partial(q.get, True, 15))
+                except queue.Empty:
+                    yield ": ping\n\n"
+                    continue
+                yield f"event: job\ndata: {json.dumps(job)}\n\n"
+        finally:
+            job_manager.unsubscribe(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # --- search ---

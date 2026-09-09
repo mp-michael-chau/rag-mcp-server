@@ -43,10 +43,18 @@ export default function NavBar() {
       }
     };
     void load();
-    const t = setInterval(() => void load(), 15000);
+    const t = setInterval(() => {
+      if (document.hidden) return; // no point updating a badge nobody sees
+      void load();
+    }, 15000);
+    const onVisibility = () => {
+      if (!document.hidden) void load(); // refresh immediately on return (badge may be stale)
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 

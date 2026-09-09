@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api, type ProjectSummary } from "@/lib/api";
 import { useJobs } from "@/components/JobsProvider";
@@ -173,7 +173,7 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
-  const { refresh } = useJobs();
+  const { finished, refresh } = useJobs();
 
   const load = useCallback(async () => {
     try {
@@ -187,9 +187,21 @@ export default function DashboardPage() {
 
   useEffect(() => {
     queueMicrotask(() => void load());
-    const t = setInterval(() => void load(), 5000);
-    return () => clearInterval(t);
   }, [load]);
+
+  // any finished job can change file counts; bursts collapse into one 250ms-debounced load
+  const handledTerminal = useRef<Set<string>>(new Set());
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const fresh = finished.filter((j) => !handledTerminal.current.has(j.id));
+    if (fresh.length === 0) return;
+    for (const j of fresh) handledTerminal.current.add(j.id);
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    reloadTimer.current = setTimeout(() => void load(), 250);
+    return () => {
+      if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    };
+  }, [finished, load]);
 
   return (
     <div>

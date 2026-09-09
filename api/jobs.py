@@ -21,6 +21,7 @@ import uuid
 
 MAX_FINISHED_JOBS = 100  # prune finished jobs beyond this many
 LOG_TAIL = 50  # lines exposed per job
+SUBSCRIBER_MAXSIZE = 1000  # per-subscriber event backlog; overflow drops (reconnect snapshot reconciles)
 
 
 class Job:
@@ -66,6 +67,7 @@ class JobContext:
     def set_progress(self, text):
         with self._manager._lock:
             self._job.progress = text
+            self._manager._notify_locked(self._job)
 
     def log(self, text):
         with self._manager._lock:
@@ -78,8 +80,38 @@ class JobManager:
         self._jobs = {}
         self._order = []
         self._queue = queue.Queue()
+        self._subscribers = []  # SSE subscriber queues, guarded by _lock
         self._worker = threading.Thread(target=self._worker_loop, name="rag-job-worker", daemon=True)
         self._worker.start()
+
+    def subscribe(self) -> queue.Queue:
+        """Register an SSE subscriber; returns a queue job snapshots are fanned out to.
+        Events published between subscribe() and the endpoint's initial snapshot
+        are retained in the queue, so the stream is at-least-once."""
+        q = queue.Queue(maxsize=SUBSCRIBER_MAXSIZE)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def _notify_locked(self, job) -> None:
+        """Fan a job snapshot out to every subscriber. Caller must hold _lock.
+        put_nowait never blocks; a full queue means a slow/stuck consumer, and
+        dropping is fine — its reconnect snapshot reconciles."""
+        if not self._subscribers:
+            return
+        data = job.to_dict()
+        for q in self._subscribers:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
 
     def submit(self, job_type, run_fn, target, project_id=None, name=None):
         """Register + enqueue a job. Registration happens synchronously under the lock,
@@ -90,6 +122,7 @@ class JobManager:
             self._jobs[job.id] = job
             self._order.append(job.id)
             self._prune_locked()
+            self._notify_locked(job)  # queued event: makes instant jobs visible without polling
         self._queue.put(job.id)
         return job
 
@@ -150,6 +183,7 @@ class JobManager:
                 with self._lock:
                     job.status = "running"
                     job.started_at = time.time()
+                    self._notify_locked(job)
                 ctx = JobContext(self, job)
                 try:
                     job._run(ctx)
@@ -157,11 +191,13 @@ class JobManager:
                         job.status = "done"
                         job.finished_at = time.time()
                         job.progress = ""
+                        self._notify_locked(job)
                 except Exception as e:  # noqa: BLE001 — job errors are reported, never kill the worker
                     with self._lock:
                         job.status = "error"
                         job.error = str(e)
                         job.finished_at = time.time()
                         job.log.append(f"Error: {e}")
+                        self._notify_locked(job)
             finally:
                 self._queue.task_done()
