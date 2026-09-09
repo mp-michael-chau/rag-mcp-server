@@ -2,6 +2,9 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { api, type Job } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 
 interface JobsContextValue {
   /** queued + running jobs, polled live */
@@ -61,7 +64,7 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
   }, [poll]);
 
   useEffect(() => {
-    void poll();
+    queueMicrotask(() => void poll());
     const t = setInterval(() => void poll(), 1000);
     return () => clearInterval(t);
   }, [poll]);
@@ -107,10 +110,10 @@ function JobPanel() {
       {finished.map((j) => (
         <div
           key={j.id}
-          className={`rounded-md border px-3 py-2 text-sm shadow-lg ${
+          className={`rounded-lg px-3 py-2 text-sm shadow-lg ring-1 ${
             j.status === "error"
-              ? "border-red-300 bg-red-50 text-red-800"
-              : "border-green-300 bg-green-50 text-green-800"
+              ? "bg-destructive/10 text-destructive ring-destructive/30"
+              : "bg-green-50 text-green-800 ring-green-300 dark:bg-green-950 dark:text-green-300 dark:ring-green-900"
           }`}
         >
           <div className="font-medium">
@@ -122,27 +125,22 @@ function JobPanel() {
       {active.map((j) => {
         const pct = parseProgress(j.progress);
         return (
-          <div key={j.id} className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-lg">
+          <Card key={j.id} className="gap-0 px-3 py-2 shadow-lg">
             <div className="flex items-center justify-between gap-2">
-              <span className="truncate font-medium" title={j.target}>
+              <span className="truncate text-sm font-medium" title={j.target}>
                 {j.target}
               </span>
-              <span className="shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600">
+              <Badge variant={j.status === "running" ? "secondary" : "outline"} className="shrink-0">
                 {j.status === "running" ? "running" : "queued"}
-              </span>
+              </Badge>
             </div>
             {j.progress && (
               <div className="mt-1.5">
-                <div className="h-1.5 w-full overflow-hidden rounded bg-gray-200">
-                  <div
-                    className={`h-full rounded bg-blue-500 transition-all ${pct === null ? "w-full animate-pulse" : ""}`}
-                    style={pct !== null ? { width: `${pct}%` } : undefined}
-                  />
-                </div>
-                <div className="mt-0.5 text-right text-xs text-gray-500">{j.progress}</div>
+                {pct === null ? <Progress value={100} className="animate-pulse" /> : <Progress value={pct} />}
+                <div className="mt-0.5 text-right text-xs text-muted-foreground">{j.progress}</div>
               </div>
             )}
-          </div>
+          </Card>
         );
       })}
     </div>
