@@ -2,6 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { api, type ProjectSummary, type SearchHit } from "@/lib/api";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export default function SearchPage() {
   const [query, setQuery] = useState("");
@@ -43,82 +50,86 @@ export default function SearchPage() {
   return (
     <div>
       <h1 className="mb-1 text-xl font-semibold">Search</h1>
-      <p className="mb-4 text-sm text-gray-500">
+      <p className="mb-4 text-sm text-muted-foreground">
         Same retrieval as the MCP tool: child-chunk matching, deduplicated to complete parent sections. Without a
         project filter, only global documents are searched.
       </p>
 
       <div className="mb-5 flex flex-wrap items-end gap-3">
-        <label className="flex-1 min-w-64 text-sm font-medium text-gray-700">
-          Query
-          <input
+        <div className="grid min-w-64 flex-1 gap-1.5">
+          <Label htmlFor="search-query">Query</Label>
+          <Input
+            id="search-query"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") void run();
             }}
             placeholder="e.g. preliminary materials storage requirements"
-            className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
           />
-        </label>
-        <label className="text-sm font-medium text-gray-700">
-          Project
-          <select
-            value={projectId}
-            onChange={(e) => setProjectId(e.target.value)}
-            className="mt-1 block rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-          >
-            <option value="global">global only</option>
-            {projects
-              .filter((p) => p.project_id !== "global")
-              .map((p) => (
-                <option key={p.project_id} value={p.project_id}>
-                  {p.project_id}
-                </option>
-              ))}
-          </select>
-        </label>
-        <label className="text-sm font-medium text-gray-700">
-          Sections
-          <input
+        </div>
+        <div className="grid gap-1.5">
+          <Label htmlFor="search-project">Project</Label>
+          <Select value={projectId} onValueChange={setProjectId}>
+            <SelectTrigger id="search-project" className="w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="global">global only</SelectItem>
+              {projects
+                .filter((p) => p.project_id !== "global")
+                .map((p) => (
+                  <SelectItem key={p.project_id} value={p.project_id}>
+                    {p.project_id}
+                  </SelectItem>
+                ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="grid gap-1.5">
+          <Label htmlFor="search-sections">Sections</Label>
+          <Input
+            id="search-sections"
             type="number"
             min={1}
             max={10}
             value={targetParents}
             onChange={(e) => setTargetParents(Number(e.target.value) || 3)}
-            className="mt-1 block w-20 rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+            className="w-20"
           />
-        </label>
-        <button
-          onClick={() => void run()}
-          disabled={busy || !query.trim()}
-          className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-40"
-        >
+        </div>
+        <Button onClick={() => void run()} disabled={busy || !query.trim()}>
           {busy ? "Searching…" : "Search"}
-        </button>
+        </Button>
       </div>
 
       {error && (
-        <p className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>
+        <Alert variant="destructive" className="mb-4">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
       )}
 
       {results !== null && results.length === 0 && (
-        <p className="text-sm text-gray-500">No relevant information found.</p>
+        <p className="text-sm text-muted-foreground">No relevant information found.</p>
       )}
 
       <div className="flex flex-col gap-4">
         {results?.map((hit, i) => (
-          <div key={i} className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
-            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
-              <span className="rounded bg-blue-50 px-2 py-0.5 font-medium text-blue-700">{hit.project_id}</span>
-              <span className="font-mono">{hit.source}</span>
-              {hit.headers && <span className="italic">{hit.headers}</span>}
-              <span className="ml-auto">score {hit.score?.toFixed?.(3) ?? hit.score}</span>
-            </div>
-            <pre className="max-h-96 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
-              {hit.text}
-            </pre>
-          </div>
+          <Card key={i} className="gap-0">
+            <CardContent className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Badge variant="secondary" className="font-mono">
+                  {hit.project_id}
+                </Badge>
+                <span className="font-mono">{hit.source}</span>
+                {hit.headers && <span className="italic">{hit.headers}</span>}
+                <span className="ml-auto">score {hit.score?.toFixed?.(3) ?? hit.score}</span>
+              </div>
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap text-sm leading-relaxed">
+                {hit.text}
+              </pre>
+            </CardContent>
+          </Card>
         ))}
       </div>
     </div>

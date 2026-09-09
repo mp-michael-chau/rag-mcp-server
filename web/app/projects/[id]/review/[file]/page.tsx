@@ -7,6 +7,8 @@ import { api } from "@/lib/api";
 import MarkdownEditor from "@/components/MarkdownEditor";
 import MarkdownPreview from "@/components/MarkdownPreview";
 import { useJobs } from "@/components/JobsProvider";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 const PREVIEW_MAX_CHARS = 500_000; // react-markdown is slow on multi-MB specs; preview on demand only
 
@@ -35,7 +37,7 @@ export default function ReviewEditorPage() {
   }, [projectId, fileName]);
 
   useEffect(() => {
-    void load();
+    queueMicrotask(() => void load());
   }, [load]);
 
   const dirty = content !== null && draft !== content;
@@ -76,11 +78,11 @@ export default function ReviewEditorPage() {
       <div>
         <Link
           href={`/projects/${encodeURIComponent(projectId)}`}
-          className="text-sm text-blue-600 hover:underline"
+          className="text-sm text-primary hover:underline"
         >
           ← {projectId}
         </Link>
-        <p className="mt-4 text-sm text-gray-500">{saveError ?? "Loading…"}</p>
+        <p className="mt-4 text-sm text-muted-foreground">{saveError ?? "Loading…"}</p>
       </div>
     );
   }
@@ -93,41 +95,41 @@ export default function ReviewEditorPage() {
         <div className="flex items-center gap-3">
           <Link
             href={`/projects/${encodeURIComponent(projectId)}`}
-            className="text-sm text-blue-600 hover:underline"
+            className="text-sm text-primary hover:underline"
           >
             ← {projectId}
           </Link>
           <h1 className="font-mono text-base font-semibold">{fileName}</h1>
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-muted-foreground">
             {dirty ? "unsaved changes" : savedAt ? `saved at ${savedAt}` : "review copy"}
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <button
+          <Button
+            variant="outline"
             onClick={() => setShowPreview((v) => !v)}
             disabled={!previewAvailable}
             title={previewAvailable ? "Toggle rendered preview" : "Preview disabled for very large files"}
-            className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {showPreview ? "Show editor" : "Preview"}
-          </button>
-          <button
-            onClick={() => void save()}
-            disabled={!dirty || saving || convertRunning}
-            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-40"
-          >
+          </Button>
+          <Button onClick={() => void save()} disabled={!dirty || saving || convertRunning}>
             {saving ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
       </div>
 
       {convertRunning && (
-        <p className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-          A conversion job is targeting this file — saving is disabled until it finishes.
-        </p>
+        <Alert className="mb-3 border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
+            A conversion job is targeting this file — saving is disabled until it finishes.
+          </AlertDescription>
+        </Alert>
       )}
       {saveError && (
-        <p className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{saveError}</p>
+        <Alert variant="destructive" className="mb-3">
+          <AlertDescription>{saveError}</AlertDescription>
+        </Alert>
       )}
 
       {showPreview && previewAvailable ? (

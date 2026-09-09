@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { api, formatBytes } from "@/lib/api";
 import MarkdownEditor from "@/components/MarkdownEditor";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 
 const PREVIEW_MAX_CHARS = 500_000;
 
@@ -26,26 +27,28 @@ export default function DocViewPage() {
       <div className="mb-3 flex items-center gap-3">
         <Link
           href={`/projects/${encodeURIComponent(projectId)}`}
-          className="text-sm text-blue-600 hover:underline"
+          className="text-sm text-primary hover:underline"
         >
           ← {projectId}
         </Link>
         <h1 className="font-mono text-base font-semibold">{fileName}</h1>
         {doc && (
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-muted-foreground">
             approved · {formatBytes(new Blob([doc.content]).size)} · read-only
           </span>
         )}
       </div>
       {error ? (
-        <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
       ) : doc === null ? (
-        <p className="text-sm text-gray-500">Loading…</p>
+        <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
         <MarkdownEditor value={doc.content} />
       )}
       {doc && doc.content.length > PREVIEW_MAX_CHARS && (
-        <p className="mt-2 text-xs text-gray-400">Very large file — rendered preview disabled.</p>
+        <p className="mt-2 text-xs text-muted-foreground">Very large file — rendered preview disabled.</p>
       )}
     </div>
   );

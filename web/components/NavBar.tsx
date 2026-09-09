@@ -3,24 +3,27 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 interface Health {
   qdrant: string;
   ollama: string;
 }
 
-function Badge({ name, status }: { name: string; status: string }) {
+function HealthBadge({ name, status }: { name: string; status: string }) {
   const ok = status === "ok";
   return (
-    <span
-      className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ${
-        ok ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"
-      }`}
+    <Badge
+      variant="outline"
       title={status}
+      className={
+        ok ? "text-green-700 dark:text-green-400" : "border-destructive/30 text-destructive"
+      }
     >
-      <span className={`inline-block h-2 w-2 rounded-full ${ok ? "bg-green-500" : "bg-red-500"}`} />
+      <span className={`inline-block size-2 rounded-full ${ok ? "bg-green-500" : "bg-red-500"}`} />
       {name}
-    </span>
+    </Badge>
   );
 }
 
@@ -50,22 +53,21 @@ export default function NavBar() {
   const link = (href: string, label: string) => {
     const isActive = href === "/" ? pathname === "/" : pathname.startsWith(href);
     return (
-      <Link
-        href={href}
-        className={`rounded-md px-3 py-1.5 text-sm font-medium ${
-          isActive ? "bg-gray-900 text-white" : "text-gray-600 hover:bg-gray-100 hover:text-gray-900"
-        }`}
+      <Button
+        asChild
+        variant="ghost"
+        className={isActive ? "bg-muted text-foreground hover:bg-muted" : undefined}
       >
-        {label}
-      </Link>
+        <Link href={href}>{label}</Link>
+      </Button>
     );
   };
 
   return (
-    <header className="border-b border-gray-200 bg-white">
+    <header className="border-b border-border bg-background">
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3">
         <div className="flex items-center gap-4">
-          <span className="text-base font-semibold text-gray-900">RAG Workflow</span>
+          <span className="text-base font-semibold">RAG Workflow</span>
           <nav className="flex items-center gap-1">
             {link("/", "Projects")}
             {link("/search", "Search")}
@@ -74,11 +76,11 @@ export default function NavBar() {
         <div className="flex items-center gap-2">
           {health ? (
             <>
-              <Badge name="Qdrant" status={health.qdrant} />
-              <Badge name="Ollama" status={health.ollama} />
+              <HealthBadge name="Qdrant" status={health.qdrant} />
+              <HealthBadge name="Ollama" status={health.ollama} />
             </>
           ) : (
-            <span className="text-xs text-gray-400">checking services…</span>
+            <span className="text-xs text-muted-foreground">checking services…</span>
           )}
         </div>
       </div>
