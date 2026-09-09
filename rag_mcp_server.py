@@ -1,32 +1,9 @@
 # rag_mcp_server.py
-import json
-import urllib.error
-import urllib.request
+import rag_core
 from fastmcp import FastMCP
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
-
-OLLAMA_HOST = "http://localhost:11434"
-EMBED_MODEL = "bge-m3"
-COLLECTION_NAME = "kilo-projects-info"
 
 mcp = FastMCP("Shared-RAG-Server")
-qdrant = QdrantClient(host="localhost", port=6333)
 
-def embed_text(text):
-    req = urllib.request.Request(
-        f"{OLLAMA_HOST}/api/embed",
-        data=json.dumps({"model": EMBED_MODEL, "input": [text]}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.load(resp)["embeddings"][0]
-    except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
-        raise RuntimeError(
-            f"Cannot connect to Ollama ({OLLAMA_HOST}, model {EMBED_MODEL}): {e}. "
-            "Please make sure Ollama is running (e.g. run `ollama serve`) and the model is downloaded, then retry."
-        ) from e
 
 @mcp.tool()
 def search_shared_knowledge(query: str, project_id: str = None, target_parents: int = 3) -> str:
@@ -45,47 +22,22 @@ def search_shared_knowledge(query: str, project_id: str = None, target_parents: 
         target_parents: Number of complete large sections to return (default 3)
     """
     try:
-        query_vector = embed_text(query)
+        hits = rag_core.search(query, project_id=project_id, target_parents=target_parents)
     except RuntimeError as e:
         return f"[Search failed] {e}"
 
-    search_filter = Filter(must=[
-        FieldCondition(key="project_id", match=MatchAny(any=[project_id, "global"]) if project_id else MatchValue(value="global"))
-    ])
-
-    # Over-fetch: top hits may be concentrated among multiple children of the same parent chunk,
-    # so fetch 5x the target count and deduplicate by parent_id to avoid "top-K domination" diluting results
-    fetch_limit = target_parents * 5
-
-    results = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        query_filter=search_filter,
-        limit=fetch_limit
-    ).points
-
-    if not results:
+    if not hits:
         return "No relevant information found."
 
-    # Deduplicate by parent_id: only keep the highest-scoring hit per parent chunk,
-    # returning the full parent content from payload["text"]
-    seen_parents = set()
     formatted_results = []
-    for res in results:
-        p_id = res.payload.get("parent_id") or res.id
-        if p_id in seen_parents:
-            continue
-        seen_parents.add(p_id)
-
-        parts = [f"Project: {res.payload.get('project_id')}", f"Source: {res.payload.get('source')}"]
-        if res.payload.get("headers"):
-            parts.append(f"Section: {res.payload.get('headers')}")
-        formatted_results.append(f"[{' | '.join(parts)}]\n{res.payload.get('text')}")
-
-        if len(formatted_results) >= target_parents:
-            break
+    for hit in hits:
+        parts = [f"Project: {hit.get('project_id')}", f"Source: {hit.get('source')}"]
+        if hit.get("headers"):
+            parts.append(f"Section: {hit.get('headers')}")
+        formatted_results.append(f"[{' | '.join(parts)}]\n{hit.get('text')}")
 
     return "\n\n---\n\n".join(formatted_results)
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

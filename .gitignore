@@ -11,6 +11,10 @@ my_shared_docs/
 pdf_inbox/
 md_review/
 
+# Web UI
+web/node_modules/
+web/.next/
+
 # Environment
 .env
 .env.*

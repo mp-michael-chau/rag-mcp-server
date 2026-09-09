@@ -3,3 +3,6 @@ fastmcp
 langchain-text-splitters
 docling
 pypdfium2
+fastapi
+uvicorn
+python-multipart
