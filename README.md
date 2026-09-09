@@ -21,7 +21,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 ### Data Flow (Ingest)
 
 1. Drop PDFs into `pdf_inbox/{project_id}/` (root-level files = `global`, mirroring `my_shared_docs`)
-2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below)
+2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); images are described by the Ollama VL model as `[Image]: <description>` paragraphs; after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below)
 3. **Review / edit the Markdown in `md_review/`** — this is the quality gate before anything is indexed
 4. Move the finalized `.md` into `my_shared_docs/{project_id}/` — the move itself is the approval signal
 5. Run `python ingest_docs.py` (md/txt only): `MarkdownHeaderTextSplitter` splits by H1–H3, then Parents (2000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with a `project_id` keyword index created. Each file's previous points are deleted (filter: project + source) right before its upsert, so re-ingesting an edited file leaves no stale chunks
@@ -39,6 +39,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 - **Parent-Child (Small-to-Big) retrieval**: small chunks (Children) are used for semantic matching, and complete large sections (Parents) are returned
 - **Header-aware chunking**: sections split by Markdown headers; embedding text includes the `H1 > H2 > H3` breadcrumb
 - **Docling preprocessing**: table structure reconstruction and OCR, with resumable batch conversion and a review gate before ingestion
+- **Image descriptions (Ollama VL)**: images found in converted PDFs are described by a local vision-language model (`qwen3.8:27b-mlx`); each `<!-- image -->` placeholder becomes an `[Image]: <description>` paragraph, so image content is searchable. If Ollama or the model is unavailable, the placeholder is kept and the conversion still completes
 - **Table flattening**: pipe tables (e.g. Item/Question/Reply tender clarifications) are rewritten into one `### {Item ID}` Q&A block per row, so each Q&A becomes a self-contained retrieval unit; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated page headers deduplicated, and HTML entities unescaped. Headerless tables are flattened without invented labels (truncated first-column titles, plain-text lines)
 - **Idempotent reruns**: point IDs are derived from filename and chunk indices; rerunning overwrites old data instead of stacking duplicates
 - **Ollama failure tolerance**: friendly error messages on query failure; the MCP Server keeps running
@@ -62,6 +63,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 
 - Docker (to run the Qdrant container)
 - Ollama running with the embedding model pulled: `ollama pull bge-m3`
+- For image descriptions in converted PDFs: `ollama pull qwen3.8:27b-mlx` (optional; conversion works without it, image placeholders are kept)
 - Python venv with dependencies installed: `pip install -r requirements.txt`
 - Node.js (only for the optional web UI)
 
@@ -106,6 +108,7 @@ python ingest_docs.py
 - **Review gate**: nothing from a PDF is indexed until you move its reviewed `.md` into `my_shared_docs/`; the move is the approval signal
 - **Table flattening**: after a fresh conversion, pipe tables are rewritten into per-row `### {Item ID}` Q&A blocks with `[Question]:`/`[Reply]:` label lines; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated table headers dropped, merged-cell title rows collapsed, and item-code-fused rows (e.g. `TC1-C2 Please advise...`) split back into ID + text. Files that are up to date are never re-flattened, so manual review edits are safe; the flatten step is idempotent. Known limitation: Docling-level column fusion / word-order errors (e.g. a reply starting with "terms after the") cannot be auto-repaired — fix them during review. Existing `md_review/` files can be migrated in place: `python flatten_md_tables.py md_review/`
 - **Conversion resume**: conversion is written incrementally in 40-page batches and automatically resumes from where it left off after interruption; a finished review md is reused when the source PDF is unchanged (manual edits preserved). If the PDF changes, the old review md is backed up as `{name}.md.prev` and the PDF is reconverted. If the finalized md already exists in `my_shared_docs/`, the PDF is skipped entirely
+- **Image descriptions**: each image is sent to the local Ollama VL model (`qwen3.8:27b-mlx`, configurable via `VL_MODEL` in `rag_core.py`) and its description replaces the `<!-- image -->` placeholder. Image-heavy PDFs take considerably longer to convert; a failed description (Ollama down, model missing) keeps the placeholder without aborting the conversion
 - **First run**: Docling needs to download models (several hundred MB); converting large PDFs (hundreds of pages) may take tens of minutes
 - **PDFs in `my_shared_docs/`**: `ingest_docs.py` does not ingest PDFs directly; it prints a warning and skips them
 - **Safe to rerun**: chunk IDs are derived from `filename + chunk index`; rerunning the same file overwrites old data instead of stacking duplicates

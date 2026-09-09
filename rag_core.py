@@ -48,6 +48,9 @@ EMBED_MODEL = "bge-m3"
 CONVERT_BATCH_PAGES = 40  # Pages per conversion batch (limits memory usage; resumable after interruption)
 EMBED_BATCH = 32  # Texts per Ollama /api/embed call
 UPSERT_BATCH = 100  # Points per Qdrant upsert call (32MB single-request payload limit)
+VL_MODEL = "qwen3.8:27b-mlx"  # Ollama vision-language model describing images found in PDFs
+VL_PROMPT = "Describe this image:"  # Prompt sent with each image; English prompt → English descriptions (matches the mostly-English corpus)
+VL_TIMEOUT = 300  # Seconds per VL request; a 27B model can take tens of seconds per image
 
 # Sidecar/hidden-file suffixes produced by this pipeline (importers: api/app.py listings/uploads/deletes).
 # ".flatten-tmp" is produced by flatten_md_tables.flatten_file's atomic write.
@@ -69,6 +72,8 @@ def _get_converter():
         # ACCURATE mode for table recognition: slower but better table reconstruction
         pdf_pipeline = PdfPipelineOptions()
         pdf_pipeline.table_structure_options.mode = TableFormerMode.ACCURATE
+        pdf_pipeline.generate_picture_images = True  # populate picture.image (PIL) so the VL model can describe it
+        pdf_pipeline.images_scale = 2.0  # small text/thin lines on engineering drawings stay readable
         _converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_pipeline)}
         )
@@ -174,6 +179,58 @@ def delete_points(project_id=None, source=None):
 
 # 6. PDF → Markdown conversion (Docling, resumable)
 
+def describe_image(image):
+    """Send one image (DoclingImage / PIL) to the local Ollama VL model; returns the description
+    text, or None on any failure (timeout, model not found, Ollama down...) — never raises, so a
+    VL problem can never abort a conversion; the caller keeps the placeholder instead."""
+    import base64
+    import io
+
+    try:
+        pil = getattr(image, "pil_image", image)
+        if pil is None:
+            return None
+        buf = io.BytesIO()
+        pil.convert("RGB").save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        req = urllib.request.Request(
+            f"{OLLAMA_HOST}/api/chat",
+            data=json.dumps({
+                "model": VL_MODEL,
+                "stream": False,
+                "options": {"temperature": 0},
+                "messages": [{"role": "user", "content": VL_PROMPT, "images": [b64]}],
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=VL_TIMEOUT) as resp:
+            return json.load(resp)["message"]["content"].strip()
+    except Exception as e:
+        print(f"Warning: image description failed ({e}). Please make sure Ollama is running (e.g. run "
+              f"`ollama serve`) and the model is downloaded (`ollama pull {VL_MODEL}`); placeholder kept")
+        return None
+
+
+def replace_image_placeholders(md_text, pictures):
+    """Replace each <!-- image --> placeholder in md_text with an [Image]: <description> paragraph,
+    in document order. If the placeholder count doesn't match len(pictures), keeps ALL placeholders
+    and warns (never guess the alignment — a missing description beats a wrong one). A failed or
+    image-less picture keeps its placeholder."""
+    pictures = list(pictures)
+    parts = md_text.split("<!-- image -->")
+    count = len(parts) - 1
+    if count != len(pictures):
+        if count or pictures:
+            print(f"Warning: {count} image placeholders vs {len(pictures)} pictures in this batch; keeping all placeholders")
+        return md_text
+    out = parts[0]
+    for i, (picture, rest) in enumerate(zip(pictures, parts[1:]), 1):
+        print(f"  Describing image {i}/{len(pictures)}...")
+        desc = describe_image(picture.image) if picture.image is not None else None
+        out += (f"[Image]: {desc}" if desc else "<!-- image -->") + rest
+    return out
+
+
 def convert_pdf(pdf_path, review_path, progress_cb=None):
     """Convert PDF to Markdown with Docling in batches, writing each batch to the review file; rerunning after interruption resumes from the breakpoint.
     progress_cb(done_pages, total_pages) is invoked after each batch. Returns True if a conversion actually ran to
@@ -213,7 +270,9 @@ def convert_pdf(pdf_path, review_path, progress_cb=None):
         while start <= total_pages:
             end = min(start + CONVERT_BATCH_PAGES - 1, total_pages)
             result = converter.convert(pdf_path, page_range=(start, end))
-            out.write(result.document.export_to_markdown().encode("utf-8"))
+            md = result.document.export_to_markdown()
+            md = replace_image_placeholders(md, result.document.pictures)
+            out.write(md.encode("utf-8"))
             out.write(b"\n\n")
             out.flush()
             with open(progress_path, "w", encoding="utf-8") as pf:
