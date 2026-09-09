@@ -164,6 +164,7 @@ export default function ProjectPage() {
   const [documents, setDocuments] = useState<DocumentItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionInfo, setActionInfo] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<DocumentItem | null>(null);
   const [approveOverwrite, setApproveOverwrite] = useState<{ name: string; andIngest: boolean } | null>(null);
   const { active, isTargeted, refresh } = useJobs();
@@ -193,6 +194,7 @@ export default function ProjectPage() {
 
   const enqueue = async (body: object) => {
     setActionError(null);
+    setActionInfo(null);
     try {
       await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
       refresh();
@@ -201,8 +203,23 @@ export default function ProjectPage() {
     }
   };
 
+  // Convert on an inbox PDF whose approved .md already exists would be a silent server-side skip
+  // (convert_project_pdf never reconverts a finalized doc), so explain it instead of enqueueing.
+  const convertOne = (d: DocumentItem) => {
+    if (d.already_approved) {
+      setActionError(null);
+      const md = d.name.replace(/\.[^.]*$/, ".md");
+      setActionInfo(
+        `"${d.name}" is already approved — "${md}" exists in approved docs, so conversion is skipped to protect the reviewed copy. Delete that document in the Approved documents section (this also removes its vector points) first if you want to re-convert this PDF.`,
+      );
+      return;
+    }
+    void enqueue({ type: "convert", project_id: projectId, name: d.name });
+  };
+
   const call = async (path: string, init?: RequestInit) => {
     setActionError(null);
+    setActionInfo(null);
     try {
       await api(path, init);
       void load();
@@ -320,6 +337,11 @@ export default function ProjectPage() {
           <AlertDescription className="whitespace-pre-line">{actionError}</AlertDescription>
         </Alert>
       )}
+      {actionInfo && (
+        <Alert className="mb-4">
+          <AlertDescription>{actionInfo}</AlertDescription>
+        </Alert>
+      )}
 
       {/* Inbox */}
       <section className="mb-6">
@@ -343,6 +365,14 @@ export default function ProjectPage() {
                       <td className="px-4 py-2">
                         <DocName item={d} />
                         <span className="ml-2 text-xs text-muted-foreground">{formatBytes(d.size)}</span>
+                        {d.already_approved && (
+                          <Badge
+                            variant="outline"
+                            className="ml-2 border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-400"
+                          >
+                            approved — delete docs copy to re-convert
+                          </Badge>
+                        )}
                       </td>
                       <td className="w-48 px-4 py-2">
                         {job?.progress ? (
@@ -354,7 +384,7 @@ export default function ProjectPage() {
                       <td className="w-32 px-4 py-2 text-right whitespace-nowrap">
                         <Button
                           size="sm"
-                          onClick={() => void enqueue({ type: "convert", project_id: projectId, name: d.name })}
+                          onClick={() => convertOne(d)}
                           disabled={fileBusy("convert", d.name)}
                         >
                           Convert

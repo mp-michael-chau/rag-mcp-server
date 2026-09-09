@@ -46,6 +46,8 @@ export interface DocumentItem {
   kind: "pdf" | "md" | "txt" | "other";
   size: number;
   mtime: number;
+  /** inbox PDFs only: an approved .md already exists in docs, so convert would be skipped */
+  already_approved?: boolean;
   convert_progress?: { done_pages: number | null; total_pages: number | null };
   chunk_count?: number | null;
 }

@@ -185,6 +185,10 @@ def project_documents(project_id: str):
                 "size": st.st_size,
                 "mtime": st.st_mtime,
             }
+            if stage == "inbox" and kind == "pdf":
+                # mirrors convert_project_pdf's finalized-md skip rule, so the UI can explain
+                # up front why clicking Convert on this PDF would be a no-op
+                item["already_approved"] = rag_core.finalized_md_path(pid, path.name) is not None
             if stage == "review":
                 sidecar = path.with_name(path.name + ".progress")
                 if sidecar.exists():

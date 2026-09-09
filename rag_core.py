@@ -289,19 +289,25 @@ def convert_pdf(pdf_path, review_path, progress_cb=None):
     return True
 
 
+def finalized_md_path(project_id, filename):
+    """Path of the approved .md for an inbox source file, or None if it has not been approved yet.
+    global documents live at the my_shared_docs root (mirroring the two-level scan), but the legacy
+    my_shared_docs/global/ subfolder location is also checked so old-layout approvals still count."""
+    stem = os.path.splitext(filename)[0]
+    candidates = [os.path.join(project_dir(DOCS_DIR, project_id), stem + ".md")]
+    if project_id == "global":
+        candidates.append(os.path.join(DOCS_DIR, "global", stem + ".md"))
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
 def convert_project_pdf(project_id, filename, progress_cb=None):
     """Convert a single pdf_inbox PDF through the full convert rules (finalized-md skip, resume, flatten after
     fresh conversion only). Returns {"status": converted|skipped|error, "message": str}."""
     filepath = os.path.join(project_dir(PDF_INBOX_DIR, project_id), filename)
     stem = os.path.splitext(filename)[0]
 
-    # Finalized md already moved into my_shared_docs → never reconvert (protects the reviewed/approved copy);
-    # global documents live at the my_shared_docs root (mirroring the two-level scan), but the legacy
-    # my_shared_docs/global/ subfolder location is also checked so old-layout approvals still count
-    finalized_paths = [os.path.join(project_dir(DOCS_DIR, project_id), stem + ".md")]
-    if project_id == "global":
-        finalized_paths.append(os.path.join(DOCS_DIR, "global", stem + ".md"))
-    if any(os.path.exists(p) for p in finalized_paths):
+    # Finalized md already moved into my_shared_docs → never reconvert (protects the reviewed/approved copy)
+    if finalized_md_path(project_id, filename):
         print(f"PDF: {project_id}/{filename} → finalized md already present, skip")
         return {"status": "skipped", "message": f"{project_id}/{filename}: finalized md already present, skipped"}
 
