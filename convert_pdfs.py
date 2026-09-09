@@ -5,6 +5,8 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
 
+import flatten_md_tables
+
 # 1. Folder layout (mirrors the my_shared_docs convention: root-level files = global, first-level subfolders = project_id)
 PDF_INBOX_DIR = "./pdf_inbox" # Drop PDFs to convert here
 MD_REVIEW_DIR = "./md_review" # Docling output awaiting user review; moving the finished .md into my_shared_docs IS the approval
@@ -26,14 +28,15 @@ def get_pdf_page_count(filepath):
         pdf.close()
 
 def convert_pdf(pdf_path, review_path):
-    """Convert PDF to Markdown with Docling in batches, writing each batch to the review file; rerunning after interruption resumes from the breakpoint"""
+    """Convert PDF to Markdown with Docling in batches, writing each batch to the review file; rerunning after interruption resumes from the breakpoint.
+    Returns True if a conversion actually ran to completion, False on the up-to-date skip path."""
     progress_path = review_path + ".progress"
 
     # Review md exists, conversion finished (no .progress) and not older than the source PDF → keep it (preserves manual edits made during review)
     if (os.path.exists(review_path) and not os.path.exists(progress_path)
             and os.path.getmtime(review_path) >= os.path.getmtime(pdf_path)):
         print(f"  Review md up to date, skip: {review_path}")
-        return
+        return False
 
     # Source PDF changed → back up the old review md (only one .prev is kept) and reconvert
     if os.path.exists(review_path) and os.path.getmtime(review_path) < os.path.getmtime(pdf_path):
@@ -72,6 +75,7 @@ def convert_pdf(pdf_path, review_path):
     with open(review_path, "r", encoding="utf-8") as f:
         if not f.read().strip():
             print(f"Warning: conversion produced no text for {pdf_path}; it may be a scan without a text layer")
+    return True
 
 def convert_inbox():
     if not os.path.isdir(PDF_INBOX_DIR):
@@ -112,9 +116,17 @@ def convert_inbox():
         review_path = os.path.join(MD_REVIEW_DIR, project_id, stem + ".md")
         os.makedirs(os.path.dirname(review_path), exist_ok=True)
         try:
-            convert_pdf(filepath, review_path)
+            converted = convert_pdf(filepath, review_path)
         except Exception as e:
             print(f"Warning: Docling conversion failed for {project_id}/{filename} ({e}); skipped")
+        else:
+            # Flatten tables only after a fresh conversion (the skip path is never flattened, protecting manual review edits);
+            # a flatten failure keeps the raw Docling output for review as usual
+            if converted:
+                try:
+                    flatten_md_tables.flatten_file(review_path)
+                except Exception as e:
+                    print(f"Warning: table flattening failed for {review_path} ({e}); keeping raw Docling output")
 
     print(f"Done. Review/edit the Markdown in {MD_REVIEW_DIR}/, then move the finalized .md files into {DOCS_DIR}/ and run ingest_docs.py.")
 

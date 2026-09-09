@@ -11,13 +11,14 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 | Qdrant (`docker-compose.yml`) | Vector database; HTTP/Dashboard port `6333`, gRPC port `6334`, data stored in `qdrant_storage/` |
 | Ollama + `bge-m3` | Embedding model (1024 dims), served at `localhost:11434` |
 | `convert_pdfs.py` | PDF→Markdown conversion script (Docling); converts `pdf_inbox/` into reviewable Markdown in `md_review/` |
+| `flatten_md_tables.py` | Post-processing script: rewrites Markdown pipe tables into one `### {Item ID}` Q&A block per row (auto-run by `convert_pdfs.py` after fresh conversions; can also be run manually, e.g. `python flatten_md_tables.py md_review/`) |
 | `ingest_docs.py` | Ingestion script: md/txt sources → Parent-Child chunking, vectorization, upsert into Qdrant |
 | `rag_mcp_server.py` | FastMCP stdio server exposing `search_shared_knowledge(query, project_id, target_parents=3)` |
 
 ### Data Flow (Ingest)
 
 1. Drop PDFs into `pdf_inbox/{project_id}/` (root-level files = `global`, mirroring `my_shared_docs`)
-2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption)
+2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below)
 3. **Review / edit the Markdown in `md_review/`** — this is the quality gate before anything is indexed
 4. Move the finalized `.md` into `my_shared_docs/{project_id}/` — the move itself is the approval signal
 5. Run `python ingest_docs.py` (md/txt only): `MarkdownHeaderTextSplitter` splits by H1–H3, then Parents (2000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with a `project_id` keyword index created
@@ -35,6 +36,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 - **Parent-Child (Small-to-Big) retrieval**: small chunks (Children) are used for semantic matching, and complete large sections (Parents) are returned
 - **Header-aware chunking**: sections split by Markdown headers; embedding text includes the `H1 > H2 > H3` breadcrumb
 - **Docling preprocessing**: table structure reconstruction and OCR, with resumable batch conversion and a review gate before ingestion
+- **Table flattening**: pipe tables (e.g. Item/Question/Reply tender clarifications) are rewritten into one `### {Item ID}` Q&A block per row, so each Q&A becomes a self-contained retrieval unit; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated page headers deduplicated, and HTML entities unescaped. Headerless tables are flattened without invented labels (truncated first-column titles, plain-text lines)
 - **Idempotent reruns**: point IDs are derived from filename and chunk indices; rerunning overwrites old data instead of stacking duplicates
 - **Ollama failure tolerance**: friendly error messages on query failure; the MCP Server keeps running
 
@@ -46,6 +48,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 - `converted_md/` — Legacy conversion cache from the old single-script workflow (safe to delete; keep `02-Particular-Specification-points-list.md` if still needed)
 - `qdrant_storage/` — Qdrant data directory (Docker bind mount)
 - `convert_pdfs.py` — PDF→Markdown conversion script (review gate)
+- `flatten_md_tables.py` — Table flattening script (auto-run after fresh conversions; `python flatten_md_tables.py md_review/` migrates existing files in place)
 - `ingest_docs.py` — Ingestion script (documents → chunks → vectors → Qdrant)
 - `rag_mcp_server.py` — MCP Server (provides the retrieval tool)
 
@@ -77,7 +80,7 @@ For Markdown/text files, put them directly into `my_shared_docs/{project-id}/` (
 For PDFs, go through the conversion + review workflow first:
 
 1. Put the PDFs into `pdf_inbox/{project-id}/`
-2. Convert them to reviewable Markdown:
+2. Convert them to reviewable Markdown (tables are flattened automatically right after the conversion):
 
 ```bash
 python convert_pdfs.py
@@ -94,6 +97,7 @@ python ingest_docs.py
 ### Notes
 
 - **Review gate**: nothing from a PDF is indexed until you move its reviewed `.md` into `my_shared_docs/`; the move is the approval signal
+- **Table flattening**: after a fresh conversion, pipe tables are rewritten into per-row `### {Item ID}` Q&A blocks with `[Question]:`/`[Reply]:` label lines; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated table headers dropped, merged-cell title rows collapsed, and item-code-fused rows (e.g. `TC1-C2 Please advise...`) split back into ID + text. Files that are up to date are never re-flattened, so manual review edits are safe; the flatten step is idempotent. Known limitation: Docling-level column fusion / word-order errors (e.g. a reply starting with "terms after the") cannot be auto-repaired — fix them during review. Existing `md_review/` files can be migrated in place: `python flatten_md_tables.py md_review/`
 - **Conversion resume**: conversion is written incrementally in 40-page batches and automatically resumes from where it left off after interruption; a finished review md is reused when the source PDF is unchanged (manual edits preserved). If the PDF changes, the old review md is backed up as `{name}.md.prev` and the PDF is reconverted. If the finalized md already exists in `my_shared_docs/`, the PDF is skipped entirely
 - **First run**: Docling needs to download models (several hundred MB); converting large PDFs (hundreds of pages) may take tens of minutes
 - **PDFs in `my_shared_docs/`**: `ingest_docs.py` does not ingest PDFs directly; it prints a warning and skips them
