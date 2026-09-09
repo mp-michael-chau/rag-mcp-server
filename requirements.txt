@@ -2,3 +2,4 @@ qdrant-client
 fastmcp
 langchain-text-splitters
 docling
+pypdfium2

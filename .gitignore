@@ -8,6 +8,8 @@ __pycache__/
 converted_md/
 qdrant_storage/
 my_shared_docs/
+pdf_inbox/
+md_review/
 
 # Environment
 .env

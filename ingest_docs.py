@@ -3,10 +3,6 @@ import json
 import uuid
 import argparse
 import urllib.request
-import pypdfium2 as pdfium
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -15,21 +11,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHea
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 COLLECTION_NAME = "kilo-projects-info"
-DOCS_DIR = "./my_shared_docs" # Put the files you want to share across projects here
-CONVERTED_DIR = "./converted_md" # Markdown cache of Docling conversions (reused when the source PDF is unchanged)
-CONVERT_BATCH_PAGES = 40 # Pages per conversion batch (limits memory usage; resumable after interruption)
+DOCS_DIR = "./my_shared_docs" # Put the files you want to share across projects here (md/txt only; PDFs go through convert_pdfs.py first)
 OLLAMA_HOST = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"
 
 # 2. Initialize database connection
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-
-# 3. Docling PDF converter (ACCURATE mode for table recognition: slower but better table reconstruction)
-pdf_pipeline = PdfPipelineOptions()
-pdf_pipeline.table_structure_options.mode = TableFormerMode.ACCURATE
-converter = DocumentConverter(
-    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_pipeline)}
-)
 
 def embed_texts(texts):
     """Call the Ollama embedding API in batches"""
@@ -41,7 +28,7 @@ def embed_texts(texts):
     with urllib.request.urlopen(req) as resp:
         return json.load(resp)["embeddings"]
 
-# 4. Ensure the collection exists (dimension determined by the actual Ollama model output)
+# 3. Ensure the collection exists (dimension determined by the actual Ollama model output)
 def ensure_collection():
     if not qdrant.collection_exists(COLLECTION_NAME):
         qdrant.create_collection(
@@ -58,7 +45,7 @@ def ensure_collection():
     except Exception:
         pass
 
-# 5. Text chunking settings: Parent-Child (Small-to-Big) architecture
+# 4. Text chunking settings: Parent-Child (Small-to-Big) architecture
 #    Parent = complete large section (stored in each Child's payload["text"] and returned directly at retrieval time, preserving full context)
 #    Child  = small chunk (only Children are vectorized, for precise semantic matching)
 #    First split into Parents by Markdown header levels (H1-H3) with parent header breadcrumbs, then split overly long sections by length
@@ -99,59 +86,6 @@ def split_parents_with_headers(content):
             results.append((breadcrumb, parent_text))
     return results
 
-def get_pdf_page_count(filepath):
-    pdf = pdfium.PdfDocument(filepath)
-    try:
-        return len(pdf)
-    finally:
-        pdf.close()
-
-def convert_pdf_to_markdown(filepath, project_id):
-    """Convert PDF to Markdown with Docling in batches, writing each batch to the cache; rerunning after interruption resumes from the breakpoint"""
-    os.makedirs(CONVERTED_DIR, exist_ok=True)
-    # Cache filename is prefixed with project_id to prevent same-named PDFs across projects from overwriting each other's caches
-    cache_path = os.path.join(CONVERTED_DIR, f"{project_id}__{os.path.basename(filepath)}.md")
-    progress_path = cache_path + ".progress"
-
-    # Full cache exists and source PDF is unchanged → use it directly
-    if (os.path.exists(cache_path) and not os.path.exists(progress_path)
-            and os.path.getmtime(cache_path) > os.path.getmtime(filepath)):
-        print(f"  Using existing conversion result: {cache_path}")
-        with open(cache_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    # Source PDF changed → remove old progress and reconvert
-    if os.path.exists(cache_path) and os.path.getmtime(cache_path) < os.path.getmtime(filepath):
-        os.remove(cache_path)
-        if os.path.exists(progress_path):
-            os.remove(progress_path)
-
-    total_pages = get_pdf_page_count(filepath)
-    done_pages, done_bytes = 0, 0
-    if os.path.exists(progress_path):
-        with open(progress_path, "r", encoding="utf-8") as pf:
-            done_pages, done_bytes = (int(x) for x in pf.read().strip().split(","))
-    print(f"  Converting with Docling ({done_pages}/{total_pages} pages done, {CONVERT_BATCH_PAGES} pages per batch)")
-
-    with open(cache_path, "ab" if done_pages else "wb") as out:
-        if done_pages:
-            out.truncate(done_bytes)
-        start = done_pages + 1
-        while start <= total_pages:
-            end = min(start + CONVERT_BATCH_PAGES - 1, total_pages)
-            result = converter.convert(filepath, page_range=(start, end))
-            out.write(result.document.export_to_markdown().encode("utf-8"))
-            out.write(b"\n\n")
-            out.flush()
-            with open(progress_path, "w", encoding="utf-8") as pf:
-                pf.write(f"{end},{out.tell()}")
-            print(f"  Converted {end}/{total_pages} pages")
-            start = end + 1
-
-    os.remove(progress_path)
-    with open(cache_path, "r", encoding="utf-8") as f:
-        return f.read()
-
 def ingest_directory():
     points = []
 
@@ -170,13 +104,9 @@ def ingest_directory():
             doc_sources.append(("global", entry, entry_path))
 
     for project_id, filename, filepath in doc_sources:
-        if filename.endswith('.pdf'):
-            # First convert PDF to Markdown with Docling, then proceed with chunking
-            try:
-                content = convert_pdf_to_markdown(filepath, project_id)
-            except Exception as e:
-                print(f"Warning: Docling conversion failed for {project_id}/{filename} ({e}); skipped")
-                continue
+        if filename.lower().endswith('.pdf'):
+            print(f"Warning: PDFs are not ingested directly; put them in pdf_inbox/, run convert_pdfs.py, review in md_review/, then move the md here ({project_id}/{filename} skipped)")
+            continue
         elif filename.endswith(('.txt', '.md')):
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -184,7 +114,7 @@ def ingest_directory():
             continue
 
         if not content.strip():
-            print(f"Warning: no text extracted from {project_id}/{filename}; it may be a scanned PDF (OCR required)")
+            print(f"Warning: no text found in {project_id}/{filename}; skipped")
             continue
 
         print(f"Processing: {project_id}/{filename}")
