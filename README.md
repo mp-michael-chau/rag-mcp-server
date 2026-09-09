@@ -19,7 +19,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 2. PDFs are first converted to Markdown by Docling (table reconstruction in ACCURATE mode, built-in OCR); results are cached in `converted_md/`, written incrementally in 40-page batches and resumable after interruption
 3. `MarkdownHeaderTextSplitter` splits by H1–H3 sections, then splits Parents (2000/0) and Children (300/50)
 4. Embedding text = header breadcrumb + Child content, vectorized by bge-m3
-5. Idempotent point IDs generated with uuid5, upserted into the `shared_knowledge` collection, with a `project_id` keyword index created
+5. Idempotent point IDs generated with uuid5, upserted into the `kilo-projects-info` collection, with a `project_id` keyword index created
 
 ### Query Flow
 
@@ -83,7 +83,7 @@ python ingest_docs.py
 - **Safe to rerun**: chunk IDs are derived from `filename + chunk index`; rerunning the same file overwrites old data instead of stacking duplicates
 - **Changed file content**: if you edit a file and rerun, leftover chunks from the older file may remain; the clean approach is to delete the collection and rerun:
 ```bash
-curl -X DELETE http://localhost:6333/collections/shared_knowledge
+curl -X DELETE http://localhost:6333/collections/kilo-projects-info
 python ingest_docs.py
 ```
 

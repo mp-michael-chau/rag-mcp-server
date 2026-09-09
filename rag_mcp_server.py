@@ -8,6 +8,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 
 OLLAMA_HOST = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"
+COLLECTION_NAME = "kilo-projects-info"
 
 mcp = FastMCP("Shared-RAG-Server")
 qdrant = QdrantClient(host="localhost", port=6333)
@@ -57,7 +58,7 @@ def search_shared_knowledge(query: str, project_id: str = None, target_parents: 
     fetch_limit = target_parents * 5
 
     results = qdrant.query_points(
-        collection_name="shared_knowledge",
+        collection_name=COLLECTION_NAME,
         query=query_vector,
         query_filter=search_filter,
         limit=fetch_limit

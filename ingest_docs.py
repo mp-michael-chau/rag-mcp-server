@@ -14,7 +14,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHea
 # 1. System settings
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
-COLLECTION_NAME = "shared_knowledge"
+COLLECTION_NAME = "kilo-projects-info"
 DOCS_DIR = "./my_shared_docs" # Put the files you want to share across projects here
 CONVERTED_DIR = "./converted_md" # Markdown cache of Docling conversions (reused when the source PDF is unchanged)
 CONVERT_BATCH_PAGES = 40 # Pages per conversion batch (limits memory usage; resumable after interruption)
