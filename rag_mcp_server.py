@@ -4,7 +4,7 @@ import urllib.error
 import urllib.request
 from fastmcp import FastMCP
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchAny
+from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 
 OLLAMA_HOST = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"
@@ -35,12 +35,12 @@ def search_shared_knowledge(query: str, project_id: str = None, target_parents: 
     deduplicates by parent_id, and returns complete large sections to keep full context.
 
     When project_id is given, only that project is searched, automatically including global shared documents;
-    when project_id is omitted, everything is searched.
+    when project_id is omitted, only global shared documents are searched.
     Currently valid values: clpe-cdhk, global (i.e. folder names under my_shared_docs/).
 
     Args:
         query: Search question
-        project_id: Restrict the search to a specific project
+        project_id: Restrict the search to a specific project (default: global only)
         target_parents: Number of complete large sections to return (default 3)
     """
     try:
@@ -48,11 +48,9 @@ def search_shared_knowledge(query: str, project_id: str = None, target_parents: 
     except RuntimeError as e:
         return f"[Search failed] {e}"
 
-    search_filter = None
-    if project_id:
-        search_filter = Filter(must=[
-            FieldCondition(key="project_id", match=MatchAny(any=[project_id, "global"]))
-        ])
+    search_filter = Filter(must=[
+        FieldCondition(key="project_id", match=MatchAny(any=[project_id, "global"]) if project_id else MatchValue(value="global"))
+    ])
 
     # Over-fetch: top hits may be concentrated among multiple children of the same parent chunk,
     # so fetch 5x the target count and deduplicate by parent_id to avoid "top-K domination" diluting results
