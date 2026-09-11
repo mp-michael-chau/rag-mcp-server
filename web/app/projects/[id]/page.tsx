@@ -166,7 +166,7 @@ export default function ProjectPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionInfo, setActionInfo] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<DocumentItem | null>(null);
-  const [approveOverwrite, setApproveOverwrite] = useState<{ name: string; andIngest: boolean } | null>(null);
+  const [approveOverwrite, setApproveOverwrite] = useState<string | null>(null);
   const { active, finished, isTargeted, refresh } = useJobs();
 
   const load = useCallback(async () => {
@@ -238,7 +238,7 @@ export default function ProjectPage() {
     }
   };
 
-  const approve = async (name: string, andIngest: boolean) => {
+  const approve = async (name: string) => {
     const base = `/api/projects/${encodeURIComponent(projectId)}/approve/${encodeURIComponent(name)}`;
     setActionError(null);
     try {
@@ -246,13 +246,13 @@ export default function ProjectPage() {
         await api(base, { method: "POST" });
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) {
-          setApproveOverwrite({ name, andIngest });
+          setApproveOverwrite(name);
           return;
         } else {
           throw e;
         }
       }
-      if (andIngest) await enqueue({ type: "ingest", project_id: projectId, name });
+      await enqueue({ type: "ingest", project_id: projectId, name });
       void load();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
@@ -260,13 +260,13 @@ export default function ProjectPage() {
   };
 
   const confirmApproveOverwrite = async () => {
-    const target = approveOverwrite;
+    const name = approveOverwrite;
     setApproveOverwrite(null);
-    if (!target) return;
-    const base = `/api/projects/${encodeURIComponent(projectId)}/approve/${encodeURIComponent(target.name)}`;
+    if (!name) return;
+    const base = `/api/projects/${encodeURIComponent(projectId)}/approve/${encodeURIComponent(name)}`;
     try {
       await api(`${base}?overwrite=1`, { method: "POST" });
-      if (target.andIngest) await enqueue({ type: "ingest", project_id: projectId, name: target.name });
+      await enqueue({ type: "ingest", project_id: projectId, name });
       void load();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
@@ -375,14 +375,6 @@ export default function ProjectPage() {
                       <td className="px-4 py-2">
                         <DocName item={d} />
                         <span className="ml-2 text-xs text-muted-foreground">{formatBytes(d.size)}</span>
-                        {d.already_approved && (
-                          <Badge
-                            variant="outline"
-                            className="ml-2 border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-400"
-                          >
-                            approved — delete docs copy to re-convert
-                          </Badge>
-                        )}
                       </td>
                       <td className="w-48 px-4 py-2">
                         {job?.progress ? (
@@ -396,6 +388,10 @@ export default function ProjectPage() {
                           size="sm"
                           onClick={() => convertOne(d)}
                           disabled={fileBusy("convert", d.name)}
+                          title={
+                            d.already_approved ? "approved — delete docs copy to re-convert" : undefined
+                          }
+                          className={d.already_approved ? "opacity-50 hover:opacity-100" : undefined}
                         >
                           Convert
                         </Button>
@@ -445,22 +441,12 @@ export default function ProjectPage() {
                     </td>
                     <td className="w-64 px-4 py-2 text-right whitespace-nowrap">
                       <Button
-                        variant="outline"
                         size="sm"
-                        onClick={() => void approve(d.name, false)}
+                        onClick={() => void approve(d.name)}
                         disabled={fileBusy("convert", d.name)}
-                        title={fileBusy("convert", d.name) ? "Wait for the conversion to finish" : undefined}
+                        title={fileBusy("convert", d.name) ? "Wait for the conversion to finish" : "Approve and ingest this document"}
                       >
                         Approve
-                      </Button>
-                      <Button
-                        size="sm"
-                        className="ml-1"
-                        onClick={() => void approve(d.name, true)}
-                        disabled={fileBusy("convert", d.name)}
-                        title={fileBusy("convert", d.name) ? "Wait for the conversion to finish" : undefined}
-                      >
-                        Approve &amp; Ingest
                       </Button>
                       <DeleteButton onClick={() => setDeleting(d)} />
                     </td>
@@ -563,7 +549,7 @@ export default function ProjectPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Overwrite approved document?</AlertDialogTitle>
             <AlertDialogDescription>
-              <span className="font-mono">{approveOverwrite?.name}</span> already exists in approved docs.
+              <span className="font-mono">{approveOverwrite}</span> already exists in approved docs.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

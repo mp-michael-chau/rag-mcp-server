@@ -21,7 +21,7 @@ export default function ReviewEditorPage() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  const [showPreview, setShowPreview] = useState(false);
+  const [showPreview, setShowPreview] = useState(true);
   const { isTargeted } = useJobs();
 
   const load = useCallback(async () => {

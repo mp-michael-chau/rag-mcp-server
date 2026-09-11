@@ -29,6 +29,8 @@ export default function MarkdownEditor({
   return (
     <div className="h-[calc(100vh-16rem)] min-h-96 overflow-hidden rounded-md border border-input">
       <CodeMirror
+        className="h-full"
+        height="100%"
         value={value}
         onChange={(v) => onChange?.(v)}
         extensions={[markdown()]}
