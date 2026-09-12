@@ -12,6 +12,8 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 | Ollama + `bge-m3` | Embedding model (1024 dims), served at `localhost:11434` |
 | `rag_core.py` | Shared core logic (paths, conversion, chunking, ingestion, search) used by the CLI scripts, the MCP server and the web API |
 | `convert_pdfs.py` | PDF→Markdown conversion script (Docling); converts `pdf_inbox/` into reviewable Markdown in `md_review/` — thin CLI wrapper over `rag_core` |
+| `convert_sheets.py` | Excel/CSV→Markdown conversion script (`.xlsx`/`.xlsm`/`.csv`); converts `pdf_inbox/` spreadsheets into reviewable Markdown in `md_review/` — thin CLI wrapper over `rag_core` |
+| `sheet_to_md.py` | Spreadsheet→Markdown module used by `convert_sheets.py`: header detection, merged-cell expansion, one `### {row}` block per row; standalone use: `python sheet_to_md.py <file...>` prints to stdout |
 | `flatten_md_tables.py` | Post-processing script: rewrites Markdown pipe tables into one `### {Item ID}` Q&A block per row (auto-run by `convert_pdfs.py` after fresh conversions; can also be run manually, e.g. `python flatten_md_tables.py md_review/`) |
 | `ingest_docs.py` | Ingestion script: md/txt sources → Parent-Child chunking, vectorization, upsert into Qdrant — thin CLI wrapper over `rag_core` |
 | `rag_mcp_server.py` | FastMCP stdio server exposing `search_shared_knowledge(query, project_id, target_parents=3)` |
@@ -20,8 +22,8 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 
 ### Data Flow (Ingest)
 
-1. Drop PDFs into `pdf_inbox/{project_id}/` (root-level files = `global`, mirroring `my_shared_docs`)
-2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); images are described by the Ollama VL model as `[Image]: <description>` paragraphs; after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below)
+1. Drop PDFs and Excel/CSV spreadsheets (`.xlsx`/`.xlsm`/`.csv`) into `pdf_inbox/{project_id}/` (root-level files = `global`, mirroring `my_shared_docs`)
+2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); images are described by the Ollama VL model as `[Image]: <description>` paragraphs; after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below). For spreadsheets run `python convert_sheets.py` instead → each sheet becomes a `# {filename} — Sheet: {name}` section with one `### {row}` block per data row (same block convention as the flattened PDF tables; no flattening step needed)
 3. **Review / edit the Markdown in `md_review/`** — this is the quality gate before anything is indexed
 4. Move the finalized `.md` into `my_shared_docs/{project_id}/` — the move itself is the approval signal
 5. Run `python ingest_docs.py` (md/txt only): `MarkdownHeaderTextSplitter` splits by H1–H3, then Parents (2000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with a `project_id` keyword index created. Each file's previous points are deleted (filter: project + source) right before its upsert, so re-ingesting an edited file leaves no stale chunks
@@ -46,13 +48,15 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 
 ### Directory Overview
 
-- `pdf_inbox/` — Drop PDFs to convert here (root = `global`, first-level subfolders = `project_id`)
-- `md_review/` — Docling conversion output awaiting review; edit here, then move the finalized `.md` into `my_shared_docs/`
+- `pdf_inbox/` — Drop PDFs and Excel/CSV spreadsheets to convert here (root = `global`, first-level subfolders = `project_id`)
+- `md_review/` — Conversion output awaiting review; edit here, then move the finalized `.md` into `my_shared_docs/`
 - `my_shared_docs/` — Approved document source (root = `global`, first-level subfolders = `project_id`)
 - `converted_md/` — Legacy conversion cache from the old single-script workflow (safe to delete; keep `02-Particular-Specification-points-list.md` if still needed)
 - `qdrant_storage/` — Qdrant data directory (Docker bind mount)
 - `rag_core.py` — Shared workflow core (used by CLI, MCP server and web API)
 - `convert_pdfs.py` — PDF→Markdown conversion script (review gate)
+- `convert_sheets.py` — Excel/CSV→Markdown conversion script (review gate)
+- `sheet_to_md.py` — Spreadsheet→Markdown module (header detection, merged-cell expansion, per-row blocks)
 - `flatten_md_tables.py` — Table flattening script (auto-run after fresh conversions; `python flatten_md_tables.py md_review/` migrates existing files in place)
 - `ingest_docs.py` — Ingestion script (documents → chunks → vectors → Qdrant)
 - `rag_mcp_server.py` — MCP Server (provides the retrieval tool)
@@ -86,7 +90,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 
 For Markdown/text files, put them directly into `my_shared_docs/{project-id}/` (supports `.md`, `.txt`).
 
-For PDFs, go through the conversion + review workflow first:
+For PDFs and Excel/CSV spreadsheets, go through the conversion + review workflow first:
 
 1. Put the PDFs into `pdf_inbox/{project-id}/`
 2. Convert them to reviewable Markdown (tables are flattened automatically right after the conversion):
@@ -103,6 +107,17 @@ python convert_pdfs.py
 python ingest_docs.py
 ```
 
+For Excel/CSV spreadsheets (`.xlsx`, `.xlsm`, `.csv`), the same workflow applies with the sheet converter:
+
+1. Put the files into `pdf_inbox/{project-id}/` (same two-level layout; extension decides which script handles the file)
+2. Convert them to per-row Markdown blocks:
+
+```bash
+python convert_sheets.py
+```
+
+3. Review / edit in `md_review/{project-id}/`, move the finalized `.md` into `my_shared_docs/{project-id}/`, then run `python ingest_docs.py` as above
+
 ### Notes
 
 - **Review gate**: nothing from a PDF is indexed until you move its reviewed `.md` into `my_shared_docs/`; the move is the approval signal
@@ -110,6 +125,7 @@ python ingest_docs.py
 - **Conversion resume**: conversion is written incrementally in 40-page batches and automatically resumes from where it left off after interruption; a finished review md is reused when the source PDF is unchanged (manual edits preserved). If the PDF changes, the old review md is backed up as `{name}.md.prev` and the PDF is reconverted. If the finalized md already exists in `my_shared_docs/`, the PDF is skipped entirely
 - **Image descriptions**: each image is sent to the local Ollama VL model (`qwen3.8:27b-mlx`, configurable via `VL_MODEL` in `rag_core.py`) and its description replaces the `<!-- image -->` placeholder. Image-heavy PDFs take considerably longer to convert; a failed description (Ollama down, model missing) keeps the placeholder without aborting the conversion
 - **First run**: Docling needs to download models (several hundred MB); converting large PDFs (hundreds of pages) may take tens of minutes
+- **Spreadsheet conversion** (`convert_sheets.py`): each sheet becomes a `# {filename} — Sheet: {name}` section; the header is detected as the first row within the first 10 non-empty rows where all non-empty cells are short labels (≤40 chars) — non-empty rows above it are kept as a plain-text preamble. Each data row becomes one `### {first column}` block with `[Column]: value` label lines, mirroring `flatten_md_tables.py`; headerless sheets get plain-text lines with no invented labels; titles longer than 60 chars are truncated with `…` and kept in full inside the block. Merged cells are expanded to their anchor value in every covered row; hidden sheets are converted with a `(hidden)` marker; empty sheets are skipped. CSV files are decoded via `utf-8-sig` → `utf-16` → `big5` with auto-detected delimiters (`,`/tab/`;`). Formulas are read as their Excel cached values (a file never calculated and saved by Excel yields empty cells — fill them during review); numbers keep raw values (no currency/percent formatting); only the first detected header per sheet is used, so multi-table sheets need review. `.xls`/`.ods` are not supported — save as `.xlsx` first. Known limitation: within the same project, a `.pdf` and a spreadsheet sharing the same stem map to the same review md (`{stem}.md`), so whichever converts later replaces the other (old copy kept as `{stem}.md.prev`)
 - **PDFs in `my_shared_docs/`**: `ingest_docs.py` does not ingest PDFs directly; it prints a warning and skips them
 - **Safe to rerun**: chunk IDs are derived from `filename + chunk index`; rerunning the same file overwrites old data instead of stacking duplicates
 - **Changed file content**: each file's previous points are deleted (by `project_id` + `source` filter) right before the new upsert, so editing a file and rerunning leaves no stale chunks. Recreating the whole collection is only needed after chunking-format changes:

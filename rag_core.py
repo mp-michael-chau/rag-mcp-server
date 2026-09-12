@@ -32,6 +32,7 @@ from qdrant_client.models import (
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 import flatten_md_tables
+import sheet_to_md
 
 # 1. Base directories (absolute; anchored to this file)
 BASE_DIR = Path(__file__).resolve().parent
@@ -346,6 +347,74 @@ def convert_inbox(progress_cb=None):
 
     for project_id, filename, filepath in pdf_sources:
         convert_project_pdf(project_id, filename, progress_cb=progress_cb)
+
+    print(f"Done. Review/edit the Markdown in {MD_REVIEW_DIR}/, then move the finalized .md files into {DOCS_DIR}/ and run ingest_docs.py.")
+
+
+# 6b. Excel/CSV → Markdown conversion (block structure generated directly; no Docling, no flatten)
+
+SHEET_EXTS = (".xlsx", ".xlsm", ".csv")
+
+
+def convert_project_sheet(project_id, filename, progress_cb=None):
+    """Convert a single pdf_inbox Excel/CSV through the convert rules: finalized-md skip, mtime-based
+    reconvert (old review md backed up as .prev), atomic write. No flatten (the ### block structure is
+    generated directly) and no .progress sidecar (conversion is in-memory and atomic).
+    progress_cb(done, total) matches convert_project_pdf's signature for the future web UI integration.
+    Returns {"status": converted|skipped|error, "message": str}."""
+    filepath = os.path.join(project_dir(PDF_INBOX_DIR, project_id), filename)
+    stem = os.path.splitext(filename)[0]
+
+    # Finalized md already moved into my_shared_docs → never reconvert (protects the reviewed/approved copy)
+    if finalized_md_path(project_id, filename):
+        print(f"Sheet: {project_id}/{filename} → finalized md already present, skip")
+        return {"status": "skipped", "message": f"{project_id}/{filename}: finalized md already present, skipped"}
+
+    # Review md up to date → keep it (preserves manual edits made during review)
+    review_path = os.path.join(project_dir(MD_REVIEW_DIR, project_id), stem + ".md")
+    if os.path.exists(review_path) and os.path.getmtime(review_path) >= os.path.getmtime(filepath):
+        print(f"Sheet: {project_id}/{filename} → review md up to date, skip")
+        return {"status": "skipped", "message": f"{project_id}/{filename}: review md up to date, skipped"}
+
+    print(f"Sheet: {project_id}/{filename}")
+    os.makedirs(os.path.dirname(review_path), exist_ok=True)
+    try:
+        md = sheet_to_md.convert_file(filepath)
+        # Convert fully in memory first: on failure the old review md stays untouched; on success back
+        # it up (only one .prev kept) then swap in the new content atomically (temp file + os.replace).
+        # ".flatten-tmp" is reused so the web API already hides the temp file as a sidecar.
+        if os.path.exists(review_path):
+            os.replace(review_path, review_path + ".prev")
+        tmp_path = review_path + ".flatten-tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(md)
+        os.replace(tmp_path, review_path)
+    except Exception as e:
+        print(f"Warning: sheet conversion failed for {project_id}/{filename} ({e}); skipped")
+        return {"status": "error", "message": f"sheet conversion failed for {project_id}/{filename}: {e}"}
+    if progress_cb:
+        progress_cb(1, 1)
+    return {"status": "converted", "message": f"{project_id}/{filename}: converted → {review_path}"}
+
+
+def convert_sheets_inbox(progress_cb=None):
+    """CLI entry: convert every pending Excel/CSV (.xlsx/.xlsm/.csv) found in pdf_inbox/ (two-level scan)."""
+    if not os.path.isdir(PDF_INBOX_DIR):
+        print(f"No {PDF_INBOX_DIR} directory found. Put spreadsheets into {PDF_INBOX_DIR}/{{project_id}}/ (root-level files = global) first.")
+        return
+
+    sources = scan_doc_sources(PDF_INBOX_DIR)
+    for project_id, filename, _ in sources:
+        if filename.lower().endswith((".xls", ".ods")):
+            print(f"Warning: {project_id}/{filename}: .xls/.ods is not supported; save it as .xlsx first, then rerun")
+
+    sheet_sources = [(p, f, fp) for (p, f, fp) in sources if f.lower().endswith(SHEET_EXTS)]
+    if not sheet_sources:
+        print(f"No spreadsheets ({', '.join(SHEET_EXTS)}) found in {PDF_INBOX_DIR}.")
+        return
+
+    for project_id, filename, filepath in sheet_sources:
+        convert_project_sheet(project_id, filename, progress_cb=progress_cb)
 
     print(f"Done. Review/edit the Markdown in {MD_REVIEW_DIR}/, then move the finalized .md files into {DOCS_DIR}/ and run ingest_docs.py.")
 
