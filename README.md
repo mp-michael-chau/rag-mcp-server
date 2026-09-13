@@ -139,7 +139,7 @@ or simply `python ingest_docs.py --rebuild`
 
 ## Web UI (optional)
 
-A local web app wraps the whole CLI workflow: dashboard with Qdrant/Ollama health badges and project cards, multi-file upload (`.pdf` → inbox, `.md`/`.txt` → approved docs), Docling conversion with live progress bars, a CodeMirror Markdown review editor with preview, Approve / Approve & Ingest actions, per-file and per-project (re-)ingest with chunk counts, a read-only viewer for approved docs, and a search tab mirroring the MCP retrieval.
+A local web app wraps the whole CLI workflow: dashboard with Qdrant/Ollama health badges and project cards, multi-file upload (`.pdf`/`.xlsx`/`.xlsm`/`.csv` → inbox, `.md`/`.txt` → approved docs), Docling conversion with live progress bars plus spreadsheet conversion into per-row `###` blocks ("Convert all pending" handles both in one job), a CodeMirror Markdown review editor with preview, Approve / Approve & Ingest actions, per-file and per-project (re-)ingest with chunk counts, a read-only viewer for approved docs, and a search tab mirroring the MCP retrieval.
 
 ### Run
 

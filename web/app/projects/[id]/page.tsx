@@ -93,7 +93,7 @@ function UploadButton({ projectId, onDone }: { projectId: string; onDone: () => 
         ref={inputRef}
         type="file"
         multiple
-        accept=".pdf,.md,.txt"
+        accept=".pdf,.md,.txt,.xlsx,.xlsm,.csv"
         className="hidden"
         onChange={(e) => e.target.files && void handleFiles(e.target.files)}
       />
@@ -213,14 +213,15 @@ export default function ProjectPage() {
     }
   };
 
-  // Convert on an inbox PDF whose approved .md already exists would be a silent server-side skip
-  // (convert_project_pdf never reconverts a finalized doc), so explain it instead of enqueueing.
+  // Convert on an inbox file whose approved .md already exists would be a silent server-side skip
+  // (convert_project_pdf/convert_project_sheet never reconverts a finalized doc), so explain it
+  // instead of enqueueing.
   const convertOne = (d: DocumentItem) => {
     if (d.already_approved) {
       setActionError(null);
       const md = d.name.replace(/\.[^.]*$/, ".md");
       setActionInfo(
-        `"${d.name}" is already approved — "${md}" exists in approved docs, so conversion is skipped to protect the reviewed copy. Delete that document in the Approved documents section (this also removes its vector points) first if you want to re-convert this PDF.`,
+        `"${d.name}" is already approved — "${md}" exists in approved docs, so conversion is skipped to protect the reviewed copy. Delete that document in the Approved documents section (this also removes its vector points) first if you want to re-convert this file.`,
       );
       return;
     }
@@ -318,7 +319,7 @@ export default function ProjectPage() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <UploadButton projectId={projectId} onDone={() => void load()} />
-          {inbox.some((d) => d.kind === "pdf") && (
+          {inbox.some((d) => d.kind === "pdf" || d.kind === "sheet") && (
             <Button
               variant="outline"
               onClick={() => void enqueue({ type: "convert", project_id: projectId })}
@@ -356,12 +357,13 @@ export default function ProjectPage() {
       {/* Inbox */}
       <section className="mb-6">
         <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          Inbox PDFs ({inbox.length})
+          Inbox files ({inbox.length})
         </h2>
         <Card className="gap-0 py-0">
           {inbox.length === 0 ? (
             <p className="px-4 py-3 text-sm text-muted-foreground">
-              No PDFs waiting. Upload <code>.pdf</code> files to convert.
+              No files waiting. Upload <code>.pdf</code>, <code>.xlsx</code>, <code>.xlsm</code>, or{" "}
+              <code>.csv</code> files to convert.
             </p>
           ) : (
             <table className="w-full text-left">

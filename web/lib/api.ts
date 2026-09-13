@@ -48,10 +48,10 @@ export interface ProjectSummary {
 export interface DocumentItem {
   name: string;
   stage: Stage;
-  kind: "pdf" | "md" | "txt" | "other";
+  kind: "pdf" | "md" | "txt" | "sheet" | "other";
   size: number;
   mtime: number;
-  /** inbox PDFs only: an approved .md already exists in docs, so convert would be skipped */
+  /** inbox PDFs/sheets only: an approved .md already exists in docs, so convert would be skipped */
   already_approved?: boolean;
   convert_progress?: { done_pages: number | null; total_pages: number | null };
   chunk_count?: number | null;

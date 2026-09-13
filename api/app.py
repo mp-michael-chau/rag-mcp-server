@@ -32,6 +32,8 @@ from api.jobs import JobManager
 STAGE_DIRS = {"inbox": rag_core.PDF_INBOX_DIR, "review": rag_core.MD_REVIEW_DIR, "docs": rag_core.DOCS_DIR}
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 HIDDEN_SUFFIXES = rag_core.SIDECAR_SUFFIXES  # single source: rag_core (+ flatten_md_tables)
+SHEET_EXTS = rag_core.SHEET_EXTS  # single source: rag_core (.xlsx/.xlsm/.csv)
+CONVERTIBLE_EXTS = (".pdf", *SHEET_EXTS)  # inbox extensions a convert job may target
 
 job_manager = JobManager()
 
@@ -181,7 +183,7 @@ def project_documents(project_id: str):
     for stage in STAGE_DIRS:
         for path in list_stage_files(stage, pid):
             ext = os.path.splitext(path.name)[1].lower()
-            kind = {"pdf": "pdf", "md": "md", "txt": "txt"}.get(ext.lstrip("."), "other")
+            kind = {"pdf": "pdf", "md": "md", "txt": "txt"}.get(ext.lstrip("."), "sheet" if ext in SHEET_EXTS else "other")
             st = path.stat()
             item = {
                 "name": path.name,
@@ -190,9 +192,9 @@ def project_documents(project_id: str):
                 "size": st.st_size,
                 "mtime": st.st_mtime,
             }
-            if stage == "inbox" and kind == "pdf":
-                # mirrors convert_project_pdf's finalized-md skip rule, so the UI can explain
-                # up front why clicking Convert on this PDF would be a no-op
+            if stage == "inbox" and kind in ("pdf", "sheet"):
+                # mirrors convert_project_pdf/convert_project_sheet's finalized-md skip rule, so the
+                # UI can explain up front why clicking Convert on this file would be a no-op
                 item["already_approved"] = rag_core.finalized_md_path(pid, path.name) is not None
             if stage == "review":
                 sidecar = path.with_name(path.name + ".progress")
@@ -232,7 +234,7 @@ async def upload(project_id: str, files: list[UploadFile] = File(...), overwrite
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(await f.read())
-        saved.append({"name": name, "stage": "inbox" if name.lower().endswith(".pdf") else "docs"})
+        saved.append({"name": name, "stage": "inbox" if name.lower().endswith(CONVERTIBLE_EXTS) else "docs"})
     if errors and not saved:
         if all(e.get("conflict") for e in errors):
             raise HTTPException(409, "; ".join(e["error"] for e in errors))
@@ -244,12 +246,16 @@ def _route_upload(pid: str, name: str) -> Path:
     if not name or name.startswith(".") or name.endswith(HIDDEN_SUFFIXES):
         raise HTTPException(400, f"Invalid file name: {name!r}")
     ext = os.path.splitext(name)[1].lower()
-    if ext == ".pdf":
+    if ext in CONVERTIBLE_EXTS:
         stage = "inbox"
     elif ext in (".md", ".txt"):
         stage = "docs"
+    elif ext in (".xls", ".ods"):
+        raise HTTPException(400, f"{name!r}: {ext} is not supported (old binary format); save it as .xlsx first")
     else:
-        raise HTTPException(400, f"Unsupported file type {name!r} (allowed: .pdf, .md, .txt)")
+        raise HTTPException(
+            400, f"Unsupported file type {name!r} (allowed: .pdf, .xlsx, .xlsm, .csv, .md, .txt)"
+        )
     return safe_file_path(STAGE_DIRS[stage], pid, name)
 
 
@@ -354,7 +360,7 @@ def create_job(body: JobCreate):
 
     if body.type == "convert":
         if pid is not None and body.name:
-            _check_job_name(pid, body.name, "inbox", (".pdf",))
+            _check_job_name(pid, body.name, "inbox", CONVERTIBLE_EXTS)
         elif pid is None and body.name:
             raise HTTPException(400, "project_id is required when converting a specific file")
         return _submit_convert(pid, body.name).to_dict()
@@ -378,22 +384,31 @@ def _ingest_progress_cb(ctx):
     return cb
 
 
+def _convert_inbox_file(pid, name, ctx):
+    """Dispatch one inbox file to the matching converter (PDF → Docling, spreadsheet → sheet_to_md).
+    Sheets convert instantly in memory, so no progress_cb (a '1/1 pages' flash would be misleading)."""
+    if name.lower().endswith(SHEET_EXTS):
+        return rag_core.convert_project_sheet(pid, name)
+    return rag_core.convert_project_pdf(pid, name, progress_cb=_convert_progress_cb(ctx))
+
+
 def _submit_convert(pid, name):
     if pid is None:
         def run(ctx):
-            ctx.log("Converting all pending PDFs")
+            ctx.log("Converting all pending PDFs and spreadsheets")
             rag_core.convert_inbox(progress_cb=_convert_progress_cb(ctx))
+            rag_core.convert_sheets_inbox(progress_cb=None)
             ctx.log("Conversion finished")
 
         return job_manager.submit("convert", run, target="convert all projects")
     if name:
-        pdf = Path(rag_core.project_dir(rag_core.PDF_INBOX_DIR, pid)) / name
-        if not pdf.is_file():
-            raise HTTPException(404, f"PDF not found in inbox: {name}")
+        src = Path(rag_core.project_dir(rag_core.PDF_INBOX_DIR, pid)) / name
+        if not src.is_file():
+            raise HTTPException(404, f"Inbox file not found: {name}")
 
         def run(ctx):
             ctx.log(f"Converting {pid}/{name}")
-            result = rag_core.convert_project_pdf(pid, name, progress_cb=_convert_progress_cb(ctx))
+            result = _convert_inbox_file(pid, name, ctx)
             ctx.log(result["message"])
             if result["status"] == "error":
                 raise RuntimeError(result["message"])
@@ -402,11 +417,11 @@ def _submit_convert(pid, name):
 
     def run(ctx):
         folder = Path(rag_core.project_dir(rag_core.PDF_INBOX_DIR, pid))
-        pdfs = [p.name for p in folder.iterdir() if visible_file(p) and p.name.lower().endswith(".pdf")] if folder.is_dir() else []
-        ctx.log(f"{len(pdfs)} PDF(s) to convert in {pid}")
-        for i, fn in enumerate(pdfs, 1):
-            ctx.log(f"[{i}/{len(pdfs)}] Converting {pid}/{fn}")
-            result = rag_core.convert_project_pdf(pid, fn, progress_cb=_convert_progress_cb(ctx))
+        files = [p.name for p in folder.iterdir() if visible_file(p) and p.name.lower().endswith(CONVERTIBLE_EXTS)] if folder.is_dir() else []
+        ctx.log(f"{len(files)} file(s) to convert in {pid}")
+        for i, fn in enumerate(files, 1):
+            ctx.log(f"[{i}/{len(files)}] Converting {pid}/{fn}")
+            result = _convert_inbox_file(pid, fn, ctx)
             ctx.log(result["message"])
             if result["status"] == "error":
                 raise RuntimeError(result["message"])
