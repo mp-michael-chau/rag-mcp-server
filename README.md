@@ -16,7 +16,8 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 | `sheet_to_md.py` | Spreadsheet→Markdown module used by `convert_sheets.py`: header detection, merged-cell expansion, one `### {row}` block per row; standalone use: `python sheet_to_md.py <file...>` prints to stdout |
 | `flatten_md_tables.py` | Post-processing script: rewrites Markdown pipe tables into one `### {Item ID}` Q&A block per row (auto-run by `convert_pdfs.py` after fresh conversions; can also be run manually, e.g. `python flatten_md_tables.py md_review/`) |
 | `ingest_docs.py` | Ingestion script: md/txt sources → Parent-Child chunking, vectorization, upsert into Qdrant — thin CLI wrapper over `rag_core` |
-| `rag_mcp_server.py` | FastMCP stdio server exposing `search_shared_knowledge(query, project_id, target_parents=3)` |
+| `rag_mcp_server.py` | FastMCP stdio server exposing `search_shared_knowledge(query, project_id, target_parents=3, ref=None)` |
+| `ref_ids.py` | Pure-function reference-ID model used at ingest and query time: clause-header promotion, breadcrumb/mention ID extraction, query ref normalization (`PS 10.3.6`, `Section 23`, `Schedule 3`, `TC2-T3` → canonical IDs) |
 | `api/` | Optional local FastAPI service (port `8100`) wrapping the whole workflow for the web UI: projects, upload, convert/ingest jobs, review editing, approval, search |
 | `web/` | Optional Next.js web UI (App Router, TypeScript, Tailwind) driving the workflow through `api/` |
 
@@ -26,19 +27,21 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); images are described by the Ollama VL model as `[Image]: <description>` paragraphs; after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below). For spreadsheets run `python convert_sheets.py` instead → each sheet becomes a `# {filename} — Sheet: {name}` section with one `### {row}` block per data row (same block convention as the flattened PDF tables; no flattening step needed)
 3. **Review / edit the Markdown in `md_review/`** — this is the quality gate before anything is indexed
 4. Move the finalized `.md` into `my_shared_docs/{project_id}/` — the move itself is the approval signal
-5. Run `python ingest_docs.py` (md/txt only): `MarkdownHeaderTextSplitter` splits by H1–H3, then Parents (2000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with a `project_id` keyword index created. Each file's previous points are deleted (filter: project + source) right before its upsert, so re-ingesting an edited file leaves no stale chunks
+5. Run `python ingest_docs.py` (md/txt only): dotted clause list lines (`- 10.3.6 The ...`) are first promoted to `### <id>` headers in memory (never touching the files on disk) so each clause becomes its own retrieval unit, then `MarkdownHeaderTextSplitter` splits by H1–H3, Parents (2000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with keyword payload indexes on `project_id`, `parent_ref_ids` (own section/clause IDs on the breadcrumb path) and `mentioned_refs` (IDs referenced in the parent text). Each file's previous points are deleted (filter: project + source) right before its upsert, so re-ingesting an edited file leaves no stale chunks
 
 ### Query Flow
 
-1. The query is vectorized by bge-m3
-2. Filtered by `project_id` (automatically includes `global`)
-3. Over-fetches `target_parents * 5` child hits
-4. Deduplicated by `parent_id`
-5. Returns complete Parent sections (default 3); if Ollama is not running, returns a `[Search failed]` message and the MCP Server does not crash
+1. Reference IDs in the query (`PS 10.3.6`, `Clause 10.3.11(d)`, `Section 23`, `Schedule 3`, `Sch.1`, `SC No. 1`, `TC2-T3`, `2400-01`) are detected and normalized (bare dotted/alphanumeric tokens only after an existence check against the index, so standards like `IEC 60502-1` are ignored); an explicit `ref` parameter overrides detection
+2. Exact ref matches come first: deep clause IDs (≥3 segments) and alphanumeric item IDs return their own clause parent; section/schedule/2-segment IDs vector-rank children within that section and return its top clauses
+3. Remaining slots (up to `target_parents`) are filled with plain vector results, deduplicated against the exact hits; hits from exact matches are tagged `matched_refs`
+4. When exact matches exist, a `Referenced by:` block lists the source files mentioning the matched ID (reverse citation lookup for compliance work)
+5. The query is vectorized by bge-m3, results are filtered by `project_id` (automatically includes `global`), over-fetched `target_parents * 5`, deduplicated by `parent_id`, and complete Parent sections returned (default 3); if Ollama is not running, returns a `[Search failed]` message and the MCP Server does not crash
 
 ### Key Features
 
 - **Parent-Child (Small-to-Big) retrieval**: small chunks (Children) are used for semantic matching, and complete large sections (Parents) are returned
+- **Section-ID search**: compliance-style references (`PS 10.3.6`, `Section 23`, `Schedule 3`, `TC2-T3`) are matched exactly against indexed clause/section IDs and returned as the first hit, with a Referenced-by reverse citation block — no vocabulary guessing needed; pure-text queries keep the unchanged vector behavior
+- **Clause-level parents**: dotted clause list lines are promoted to headers at ingest time (in memory only), so a clause like 10.3.6 is its own retrieval unit instead of being buried in a 2000-char section grab-bag
 - **Header-aware chunking**: sections split by Markdown headers; embedding text includes the `H1 > H2 > H3` breadcrumb
 - **Docling preprocessing**: table structure reconstruction and OCR, with resumable batch conversion and a review gate before ingestion
 - **Image descriptions (Ollama VL)**: images found in converted PDFs are described by a local vision-language model (`qwen3.8:27b-mlx`); each `<!-- image -->` placeholder becomes an `[Image]: <description>` paragraph, so image content is searchable. If Ollama or the model is unavailable, the placeholder is kept and the conversion still completes
@@ -54,6 +57,7 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 - `converted_md/` — Legacy conversion cache from the old single-script workflow (safe to delete; keep `02-Particular-Specification-points-list.md` if still needed)
 - `qdrant_storage/` — Qdrant data directory (Docker bind mount)
 - `rag_core.py` — Shared workflow core (used by CLI, MCP server and web API)
+- `ref_ids.py` — Reference-ID model for section-ID search (promotion, ID extraction, query normalization)
 - `convert_pdfs.py` — PDF→Markdown conversion script (review gate)
 - `convert_sheets.py` — Excel/CSV→Markdown conversion script (review gate)
 - `sheet_to_md.py` — Spreadsheet→Markdown module (header detection, merged-cell expansion, per-row blocks)
@@ -185,3 +189,16 @@ The MCP server config currently lives only in rag/kilo.json. Other projects that
 ### Making Each Project Automatically Pass Its Own project_id
 Add a rule to each project's AGENTS.md, e.g. in the clpe-cdhk project:
 `Always call search_shared_knowledge with project_id="clpe-cdhk".`
+
+### Section-ID Search
+
+The `search_shared_knowledge` tool recognizes section/clause references directly in `query`, or explicitly via the optional `ref` parameter:
+
+| Query surface | Canonical ID | Behavior |
+| --- | --- | --- |
+| `PS 10.3.6`, `Clause 10.3.11(d)`, `10.4.8` | `10.3.6`, `10.3.11`(+sub `d`), `10.4.8` | ≥3-segment clause: returns that exact clause parent first |
+| `Section 23`, `Section 25` | `23`, `25` | vector-ranks clauses within that section |
+| `Schedule No. 3`, `Schedule 3`, `Sch.1`, `SC No. 1`, `SOR Schedule Nr. 3` | `schedule-3`, `schedule-1` | vector-ranks clauses within that schedule |
+| `TC2-T3`, `TQ-T8-1`, `2400-01` | verbatim lowercase | returns that exact item's block first |
+
+Exact hits are tagged `[Exact ref match: <id>]` and followed by normal semantic results; a `Referenced by:` block lists sources mentioning the matched ID. Bare dotted/alphanumeric tokens are only trusted when the ID exists in the index (so `IEC 60502-1` never matches). Letter sub-items (`10.3.11(d)`) resolve to the containing clause.

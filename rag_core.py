@@ -14,6 +14,7 @@ project_ids (dotfolders skipped, no deeper recursion).
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -32,6 +33,7 @@ from qdrant_client.models import (
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 import flatten_md_tables
+import ref_ids
 import sheet_to_md
 
 # 1. Base directories (absolute; anchored to this file)
@@ -153,7 +155,9 @@ def embed_texts(texts):
 
 
 def ensure_collection():
-    """Create the collection (dimension probed from the actual Ollama model output) + the project_id payload index (idempotent)."""
+    """Create the collection (dimension probed from the actual Ollama model output)
+    + keyword payload indexes (idempotent): project_id, and the ref-ID arrays
+    parent_ref_ids / mentioned_refs used by section-ID exact matching."""
     if not qdrant.collection_exists(COLLECTION_NAME):
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
@@ -162,10 +166,11 @@ def ensure_collection():
                 distance=Distance.COSINE
             )
         )
-    try:
-        qdrant.create_payload_index(COLLECTION_NAME, field_name="project_id", field_schema="keyword")
-    except Exception:
-        pass
+    for field in ("project_id", "parent_ref_ids", "mentioned_refs"):
+        try:
+            qdrant.create_payload_index(COLLECTION_NAME, field_name=field, field_schema="keyword")
+        except Exception:
+            pass
 
 
 def delete_points(project_id=None, source=None):
@@ -491,12 +496,20 @@ def ingest_file(project_id, filename, progress_cb=None):
 
     print(f"Processing: {project_id}/{filename}")
 
+    # L2 structural fix (in-memory only; the file on disk is never modified):
+    # promote dotted clause list lines ("- 10.3.6 ...") to "### <id>" headers so
+    # each clause becomes its own parent, and nest letter subsection headers
+    # ("## (A) General") under their parent section.
+    content = ref_ids.promote_clause_headers(content)
+
     # Parent-Child chunking: split Parents first (with breadcrumb prefix), then split each Parent into Children;
     # only Children are vectorized; the full Parent text is stored in each Child's payload["text"]
     entries = []
     for p_idx, (breadcrumb, parent_text) in enumerate(split_parents_with_headers(content)):
         parent_full = f"{breadcrumb}\n\n{parent_text}" if breadcrumb else parent_text
         parent_id = f"{project_id}/{filename}#p{p_idx}"
+        parent_ref_ids = ref_ids.extract_header_ref_ids(breadcrumb)
+        mentioned_refs = ref_ids.extract_mentioned_refs(parent_text)
         for c_idx, child_text in enumerate(child_splitter.split_text(parent_text)):
             entries.append({
                 "breadcrumb": breadcrumb,
@@ -505,6 +518,8 @@ def ingest_file(project_id, filename, progress_cb=None):
                 "c_idx": c_idx,
                 "parent_full": parent_full,
                 "embed_src": f"{breadcrumb}\n\n{child_text}" if breadcrumb else child_text,
+                "parent_ref_ids": parent_ref_ids,
+                "mentioned_refs": mentioned_refs,
             })
 
     # Generate vectors in batches (Ollama /api/embed supports multiple inputs; embedding text = breadcrumb + Child)
@@ -527,6 +542,8 @@ def ingest_file(project_id, filename, progress_cb=None):
                     "child_index": entry["c_idx"],
                     "child_text": entry["embed_src"],  # for Dashboard debugging
                     "text": entry["parent_full"],  # full Parent content, returned directly at retrieval time
+                    "parent_ref_ids": entry["parent_ref_ids"],  # own section/clause IDs on the breadcrumb path (exact ref matching)
+                    "mentioned_refs": entry["mentioned_refs"],  # ref IDs mentioned in the parent body (Referenced-by lookup)
                 }
             )
             points.append(point)
@@ -569,46 +586,202 @@ def ingest_all(progress_cb=None):
         print("No ingestible documents found.")
 
 
-# 9. Search (Parent-Child Small-to-Big retrieval)
+# 9. Search (Parent-Child Small-to-Big retrieval + section-ID exact matching)
 
-def search(query, project_id=None, target_parents=3):
-    """Search the shared knowledge base. Returns a list of hit dicts
-    [{"score", "project_id", "source", "headers", "text"}] — one per deduplicated parent —
-    or an empty list when nothing matches. Raises RuntimeError when Ollama is unreachable.
+def _sub_in_text(text, sub):
+    """True when the letter/number sub-item "(d)"/"(ii)" appears verbatim in the text."""
+    return re.search(r"\(\s*" + re.escape(sub) + r"\s*\)", text or "", re.IGNORECASE) is not None
 
-    When project_id is given, only that project is searched, automatically including global
-    shared documents; when project_id is omitted, only global shared documents are searched."""
+
+def _hit_from_payload(payload, score):
+    return {
+        "score": score,
+        "project_id": payload.get("project_id"),
+        "source": payload.get("source"),
+        "headers": payload.get("headers"),
+        "text": payload.get("text"),
+    }
+
+
+def _scroll_all(scroll_filter, limit_per_page=256, max_points=2048):
+    """Scroll every point matching the filter (paginated); local corpus scale keeps this cheap."""
+    points, offset = qdrant.scroll(
+        collection_name=COLLECTION_NAME, scroll_filter=scroll_filter,
+        limit=limit_per_page, with_payload=True,
+    )
+    while offset is not None and len(points) < max_points:
+        page, offset = qdrant.scroll(
+            collection_name=COLLECTION_NAME, scroll_filter=scroll_filter,
+            limit=limit_per_page, offset=offset, with_payload=True,
+        )
+        points.extend(page)
+    return points
+
+
+def search_full(query, project_id=None, target_parents=3, ref=None):
+    """Search with section-ID reinforcement. Returns
+    {"hits": [...], "notes": [str], "referenced_by": {ref_id: {source: count}}}.
+
+    hits is the same list of hit dicts as search() (one per deduplicated parent),
+    where exact ref matches additionally carry "matched_refs": [ref_id, ...].
+    notes carries e.g. "[ref 'X' not found exactly; showing semantic results]".
+    referenced_by (only when exact hits exist) lists, per matched ref id, the
+    source files whose content mentions it and their distinct-parent counts —
+    the reverse-citation lookup for compliance-matrix work.
+
+    Flow: detect refs in the query (ref_ids.normalize_query_refs; an explicit
+    `ref` overrides and is trusted) → existence-check bare candidates against
+    parent_ref_ids → exact match (depth >= 3 clauses and alphanumeric IDs
+    return their own parent; shallower section/schedule refs vector-rank
+    children within the ref filter) → blend with plain vector results up to
+    target_parents → referenced-by. Zero exact hits → pure vector behavior.
+
+    When project_id is given, only that project is searched, automatically
+    including global shared documents; when project_id is omitted, only global
+    shared documents are searched. Raises RuntimeError when Ollama is unreachable."""
     query_vector = embed_texts([query])[0]
 
-    search_filter = Filter(must=[
-        FieldCondition(key="project_id", match=MatchAny(any=[project_id, "global"]) if project_id else MatchValue(value="global"))
-    ])
+    scope = FieldCondition(
+        key="project_id",
+        match=MatchAny(any=[project_id, "global"]) if project_id else MatchValue(value="global"),
+    )
 
-    # Over-fetch: top hits may be concentrated among multiple children of the same parent chunk,
-    # so fetch 5x the target count and deduplicate by parent_id to avoid "top-K domination" diluting results
-    fetch_limit = target_parents * 5
+    # 1. Detect refs (explicit `ref` overrides auto-detection and is trusted)
+    if ref is not None and str(ref).strip():
+        tokens = ref_ids.normalize_query_refs(str(ref))
+        if not tokens:
+            notes_hint = str(ref).strip()
+            tokens, notes = [], [f"[ref '{notes_hint}' not recognized as a section/clause/schedule/item ID; showing semantic results]"]
+        else:
+            notes = []
+            for t in tokens:
+                t["bare"] = False
+    else:
+        tokens = ref_ids.normalize_query_refs(query)
+        notes = []
+    tokens = tokens[:4]  # keep latency bounded on pathological queries
 
-    results = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        query_filter=search_filter,
-        limit=fetch_limit
-    ).points
-
-    hits = []
-    seen_parents = set()
-    for res in results:
-        p_id = res.payload.get("parent_id") or res.id
-        if p_id in seen_parents:
+    # 2. Existence-check bare candidates against parent_ref_ids (kills false
+    # positives like "IEC 60502-1" that happen to look like an ID)
+    confirmed = []
+    for t in tokens:
+        if not t["bare"]:
+            confirmed.append(t)
             continue
-        seen_parents.add(p_id)
-        hits.append({
-            "score": res.score,
-            "project_id": res.payload.get("project_id"),
-            "source": res.payload.get("source"),
-            "headers": res.payload.get("headers"),
-            "text": res.payload.get("text"),
-        })
-        if len(hits) >= target_parents:
-            break
-    return hits
+        try:
+            exists = qdrant.count(
+                COLLECTION_NAME, exact=True,
+                count_filter=Filter(must=[scope, FieldCondition(key="parent_ref_ids", match=MatchValue(value=t["id"]))]),
+            ).count
+        except Exception:
+            exists = 0
+        if exists:
+            confirmed.append(t)
+
+    # 3. Exact match per confirmed ref
+    exact_hits = []
+    exact_parent_ids = set()
+    for t in confirmed:
+        ref_filter = Filter(must=[scope, FieldCondition(key="parent_ref_ids", match=MatchValue(value=t["id"]))])
+        deep = t["kind"] == "alnum" or (t["kind"] == "clause" and t["id"].count(".") >= 2)
+        if deep:
+            # depth >= 3 dotted clause or alphanumeric item: its own parent, first block
+            points, _ = qdrant.scroll(COLLECTION_NAME, scroll_filter=ref_filter, limit=64, with_payload=True)
+            if not points:
+                continue
+            best = min(points, key=lambda p: (p.payload.get("parent_index") or 0, p.payload.get("child_index") or 0))
+            p_id = best.payload.get("parent_id") or str(best.id)
+            hit = _hit_from_payload(best.payload, 1.0)
+            hit["matched_refs"] = [t["id"]]
+            if p_id in exact_parent_ids:
+                for h in exact_hits:
+                    if h.get("parent_id") == p_id and t["id"] not in h["matched_refs"]:
+                        h["matched_refs"].append(t["id"])
+                exact_parent_ids.add(p_id)
+                continue
+            hit["parent_id"] = p_id
+            exact_parent_ids.add(p_id)
+            if t.get("sub") and not _sub_in_text(hit["text"], t["sub"]):
+                notes.append(f"[sub-item ({t['sub']}) not found verbatim in {t['id']}; returning the whole clause]")
+            exact_hits.append(hit)
+        else:
+            # section / 2-segment clause / schedule: many parents — vector-rank
+            # children within the ref filter, return the top target_parents clauses
+            ranked = qdrant.query_points(
+                collection_name=COLLECTION_NAME, query=query_vector,
+                query_filter=ref_filter, limit=max(target_parents * 5, 10),
+            ).points
+            added, sub_found = 0, t.get("sub") is None
+            for res in ranked:
+                if added >= target_parents:
+                    break
+                p_id = res.payload.get("parent_id") or str(res.id)
+                if _sub_in_text(res.payload.get("text"), t.get("sub") or ""):
+                    sub_found = True
+                if p_id in exact_parent_ids:
+                    continue
+                hit = _hit_from_payload(res.payload, res.score)
+                hit["matched_refs"] = [t["id"]]
+                hit["parent_id"] = p_id
+                exact_parent_ids.add(p_id)
+                exact_hits.append(hit)
+                added += 1
+            if t.get("sub") and not sub_found:
+                notes.append(f"[sub-item ({t['sub']}) not found verbatim in {t['id']}; returning the section]")
+
+    # 4. Blend: exact hits first, then fill up to target_parents with plain
+    # vector results deduplicated against the exact hits
+    hits = exact_hits
+    if len(hits) < target_parents:
+        fetch_limit = target_parents * 5
+        results = qdrant.query_points(
+            collection_name=COLLECTION_NAME, query=query_vector,
+            query_filter=Filter(must=[scope]), limit=fetch_limit,
+        ).points
+        for res in results:
+            if len(hits) >= target_parents:
+                break
+            p_id = res.payload.get("parent_id") or str(res.id)
+            if p_id in exact_parent_ids:
+                continue
+            hit = _hit_from_payload(res.payload, res.score)
+            hit["parent_id"] = p_id
+            exact_parent_ids.add(p_id)
+            hits.append(hit)
+
+    matched = {rid for h in exact_hits for rid in h.get("matched_refs", [])}
+    for t in confirmed:
+        if t["id"] not in matched:
+            notes.append(f"[ref '{t['id']}' not found exactly; showing semantic results]")
+
+    # 5. Reverse citation lookup: which sources mention the matched refs?
+    referenced_by = {}
+    for t in confirmed:
+        if t["id"] not in matched:
+            continue
+        points = _scroll_all(Filter(must=[
+            scope,
+            FieldCondition(key="mentioned_refs", match=MatchValue(value=t["id"])),
+        ]))
+        counts, seen_parents = {}, set()
+        for p in points:
+            p_id = p.payload.get("parent_id") or str(p.id)
+            if p_id in seen_parents:
+                continue
+            seen_parents.add(p_id)
+            source = p.payload.get("source")
+            counts[source] = counts.get(source, 0) + 1
+        if counts:
+            referenced_by[t["id"]] = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+    return {"hits": hits, "notes": notes, "referenced_by": referenced_by}
+
+
+def search(query, project_id=None, target_parents=3, ref=None):
+    """Search the shared knowledge base. Returns a list of hit dicts
+    [{"score", "project_id", "source", "headers", "text", ...}] — one per
+    deduplicated parent — or an empty list when nothing matches; exact ref
+    matches additionally carry "matched_refs". See search_full for the
+    section-ID behavior and metadata. Raises RuntimeError when Ollama is
+    unreachable."""
+    return search_full(query, project_id=project_id, target_parents=target_parents, ref=ref)["hits"]

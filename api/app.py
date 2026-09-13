@@ -518,6 +518,7 @@ class SearchRequest(BaseModel):
     query: str
     project_id: str | None = None
     target_parents: int = 3
+    ref: str | None = None  # explicit section/clause/schedule/item ID override ("10.3.6", "Schedule 3")
 
 
 @app.post("/api/search")
@@ -525,10 +526,18 @@ def search(body: SearchRequest):
     if not body.query.strip():
         raise HTTPException(400, "query must not be empty")
     try:
-        hits = rag_core.search(body.query, project_id=body.project_id, target_parents=body.target_parents)
+        result = rag_core.search_full(
+            body.query, project_id=body.project_id, target_parents=body.target_parents, ref=body.ref
+        )
     except RuntimeError as e:
         raise HTTPException(502, str(e))
     except Exception as e:
         # e.g. the collection does not exist yet on a fresh Qdrant volume (no ingest has ever run)
         raise HTTPException(502, f"Search failed: {e}. If the collection is missing, run an ingest first.")
-    return {"query": body.query, "project_id": body.project_id, "results": hits}
+    return {
+        "query": body.query,
+        "project_id": body.project_id,
+        "results": result["hits"],  # exact ref matches carry an extra "matched_refs" list
+        "notes": result["notes"],
+        "referenced_by": result["referenced_by"],
+    }
