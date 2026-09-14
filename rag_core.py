@@ -439,9 +439,15 @@ header_splitter = MarkdownHeaderTextSplitter(
     strip_headers=True,
 )
 
-# Parent: covers a complete section, no overlap needed
+# Parent: covers a complete section, no overlap needed.
+# Parents are never embedded (only Children are), so this cap does not affect matching
+# precision — it only bounds payload duplication (each child copies the full parent text)
+# and guards header-less flat files. Keep it large so "Parent = complete section" holds
+# for real contract clauses.
+PARENT_CHUNK_SIZE = 12000
+
 parent_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=2000,
+    chunk_size=PARENT_CHUNK_SIZE,
     chunk_overlap=0,
     separators=["\n\n", "\n", " ", ""]
 )
@@ -462,7 +468,12 @@ def split_parents_with_headers(content):
             section.metadata[key] for _, key in headers_to_split_on
             if section.metadata.get(key)
         )
-        for parent_text in parent_splitter.split_text(section.page_content):
+        parent_texts = parent_splitter.split_text(section.page_content)
+        if len(parent_texts) > 1:
+            print(f"Warning: section '{breadcrumb}' ({len(section.page_content)} chars) exceeds "
+                  f"PARENT_CHUNK_SIZE ({PARENT_CHUNK_SIZE}); split into {len(parent_texts)} parts — "
+                  f"retrieval may truncate")
+        for parent_text in parent_texts:
             results.append((breadcrumb, parent_text))
     return results
 
