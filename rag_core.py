@@ -42,16 +42,17 @@ PDF_INBOX_DIR = str(BASE_DIR / "pdf_inbox")  # Drop PDFs to convert here
 MD_REVIEW_DIR = str(BASE_DIR / "md_review")  # Docling output awaiting user review; moving the finished .md into my_shared_docs IS the approval
 DOCS_DIR = str(BASE_DIR / "my_shared_docs")  # Read-only check: if the finalized md already lives here, skip reconversion
 
-# 2. System settings
-QDRANT_HOST = "localhost"
-QDRANT_PORT = 6333
+# 2. System settings (env-overridable so the Docker stack can point at service names
+# instead of localhost; defaults keep the bare-metal CLI/dev workflow unchanged)
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 COLLECTION_NAME = "kilo-projects-info"
-OLLAMA_HOST = "http://localhost:11434"
-EMBED_MODEL = "bge-m3"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 CONVERT_BATCH_PAGES = 40  # Pages per conversion batch (limits memory usage; resumable after interruption)
 EMBED_BATCH = 32  # Texts per Ollama /api/embed call
 UPSERT_BATCH = 100  # Points per Qdrant upsert call (32MB single-request payload limit)
-VL_MODEL = "qwen3.8:27b-mlx"  # Ollama vision-language model describing images found in PDFs
+VL_MODEL = os.getenv("VL_MODEL", "qwen3.8:27b-mlx")  # Ollama vision-language model describing images found in PDFs
 VL_PROMPT = "Describe this image:"  # Prompt sent with each image; English prompt → English descriptions (matches the mostly-English corpus)
 VL_TIMEOUT = 300  # Seconds per VL request; a 27B model can take tens of seconds per image
 

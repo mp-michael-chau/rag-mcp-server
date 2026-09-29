@@ -2,6 +2,23 @@
 
 This project is a locally hosted RAG knowledge base and MCP Server that lets AI coding agents such as Kilo retrieve shared cross-project documents (e.g. specifications, technical docs) directly via the MCP tool `search_shared_knowledge`, without pasting document contents into the conversation. All components (Qdrant, Ollama) run locally, so document contents are never sent to any external API. Documents are isolated per project by `project_id`; querying a specific project automatically includes the root-level `global` shared documents.
 
+## Start Server
+
+    ./docker-compose.yml
+
+    docker compose up -d
+
+Starts the whole stack: Qdrant, the FastAPI backend (`api/`, Docling included), and the web UI. Ollama is expected on the host (models: `bge-m3`, `qwen3.8:27b-mlx`).
+
+### Web Access
+
+- Web UI: http://localhost:3300 (3000/3100/3200 are taken on this machine; change the `web` port mapping in `docker-compose.yml` if needed)
+    - Note: the `/api/*` proxy target is baked into the web image at build time (`API_ORIGIN` build arg); after changing it or the API service name, rebuild with `docker compose build web`
+- Qdrant dashboard: http://localhost:6333/dashboard
+
+---
+
+
 ## Overview
 
 ### Components
@@ -77,17 +94,6 @@ This project is a locally hosted RAG knowledge base and MCP Server that lets AI 
 
 ---
 
-## Start Server
-
-    ./docker-compose.yml
-
-    docker compose up -d
-
-### Web Access
-    http://localhost:6333/dashboard
-
----
-
 ## Ingest Documents
 
 ### Adding Shared Documents
@@ -146,6 +152,14 @@ or simply `python ingest_docs.py --rebuild`
 A local web app wraps the whole CLI workflow: dashboard with Qdrant/Ollama health badges and project cards, multi-file upload (`.pdf`/`.xlsx`/`.xlsm`/`.csv` → inbox, `.md`/`.txt` → approved docs), Docling conversion with live progress bars plus spreadsheet conversion into per-row `###` blocks ("Convert all pending" handles both in one job), a CodeMirror Markdown review editor with preview, Approve / Approve & Ingest actions, per-file and per-project (re-)ingest with chunk counts, a read-only viewer for approved docs, and a search tab mirroring the MCP retrieval.
 
 ### Run
+
+Either via Docker (everything at once — see [Start Server](#start-server)):
+
+```bash
+docker compose up -d   # web UI on http://localhost:3300
+```
+
+…or as two dev processes:
 
 1. Start the backend (from `rag/`, single process only — the job queue lives in it):
 

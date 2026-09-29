@@ -9,3 +9,41 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage:z
     restart: unless-stopped
+
+  # FastAPI backend wrapping rag_core (Docling conversion, ingest, search).
+  # Ollama is expected on the host (bge-m3 + qwen3.8:27b-mlx already pulled there);
+  # host.docker.internal reaches it from Docker Desktop, the extra_host covers Linux.
+  api:
+    build: .
+    container_name: rag_api
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      OLLAMA_HOST: http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./pdf_inbox:/app/pdf_inbox
+      - ./md_review:/app/md_review
+      - ./my_shared_docs:/app/my_shared_docs
+      - model-cache:/root/.cache # Docling/RapidOCR/HF models — keep across container rebuilds
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  # Next.js web UI (standalone build). The /api/* rewrite target is baked at build
+  # time, so API_ORIGIN is a build arg. Port 3300: 3000/3100/3200 are taken on this host.
+  web:
+    build:
+      context: web
+      args:
+        API_ORIGIN: http://api:8100
+    container_name: rag_web
+    ports:
+      - "3300:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  model-cache:
