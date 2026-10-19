@@ -1,192 +1,60 @@
-## Introduction
+# Local RAG Knowledge Base + MCP Server
 
-This project is a locally hosted RAG knowledge base and MCP Server that lets AI coding agents such as Kilo retrieve shared cross-project documents (e.g. specifications, technical docs) directly via the MCP tool `search_shared_knowledge`, without pasting document contents into the conversation. All components (Qdrant, Ollama) run locally, so document contents are never sent to any external API. Documents are isolated per project by `project_id`; querying a specific project automatically includes the root-level `global` shared documents.
-
-## Start Server
-
-    ./docker-compose.yml
-
-    docker compose up -d
-
-Starts the whole stack: Qdrant, the FastAPI backend (`api/`, Docling included), and the web UI. Ollama is expected on the host (models: `bge-m3`, `qwen3.8:27b-mlx`).
-
-### Web Access
-
-- Web UI: http://localhost:3300 (3000/3100/3200 are taken on this machine; change the `web` port mapping in `docker-compose.yml` if needed)
-    - Note: the `/api/*` proxy target is baked into the web image at build time (`API_ORIGIN` build arg); after changing it or the API service name, rebuild with `docker compose build web`
-- Qdrant dashboard: http://localhost:6333/dashboard
-
----
-
-
-## Overview
-
-### Components
-
-| Component | Description |
-| --- | --- |
-| Qdrant (`docker-compose.yml`) | Vector database; HTTP/Dashboard port `6333`, gRPC port `6334`, data stored in `qdrant_storage/` |
-| Ollama + `bge-m3` | Embedding model (1024 dims), served at `localhost:11434` |
-| `rag_core.py` | Shared core logic (paths, conversion, chunking, ingestion, search) used by the CLI scripts, the MCP server and the web API |
-| `convert_pdfs.py` | PDF→Markdown conversion script (Docling); converts `pdf_inbox/` into reviewable Markdown in `md_review/` — thin CLI wrapper over `rag_core` |
-| `convert_sheets.py` | Excel/CSV→Markdown conversion script (`.xlsx`/`.xlsm`/`.csv`); converts `pdf_inbox/` spreadsheets into reviewable Markdown in `md_review/` — thin CLI wrapper over `rag_core` |
-| `sheet_to_md.py` | Spreadsheet→Markdown module used by `convert_sheets.py`: header detection, merged-cell expansion, one `### {row}` block per row; standalone use: `python sheet_to_md.py <file...>` prints to stdout |
-| `flatten_md_tables.py` | Post-processing script: rewrites Markdown pipe tables into one `### {Item ID}` Q&A block per row (auto-run by `convert_pdfs.py` after fresh conversions; can also be run manually, e.g. `python flatten_md_tables.py md_review/`) |
-| `ingest_docs.py` | Ingestion script: md/txt sources → Parent-Child chunking, vectorization, upsert into Qdrant — thin CLI wrapper over `rag_core` |
-| `rag_mcp_server.py` | FastMCP stdio server exposing `search_shared_knowledge(query, project_id, target_parents=3, ref=None)` |
-| `ref_ids.py` | Pure-function reference-ID model used at ingest and query time: clause-header promotion, breadcrumb/mention ID extraction, query ref normalization (`PS 10.3.6`, `Section 23`, `Schedule 3`, `TC2-T3` → canonical IDs) |
-| `api/` | Optional local FastAPI service (port `8100`) wrapping the whole workflow for the web UI: projects, upload, convert/ingest jobs, review editing, approval, search |
-| `web/` | Optional Next.js web UI (App Router, TypeScript, Tailwind) driving the workflow through `api/` |
-
-### Data Flow (Ingest)
-
-1. Drop PDFs and Excel/CSV spreadsheets (`.xlsx`/`.xlsm`/`.csv`) into `pdf_inbox/{project_id}/` (root-level files = `global`, mirroring `my_shared_docs`)
-2. Run `python convert_pdfs.py` → Docling converts them to reviewable Markdown in `md_review/{project_id}/` (table reconstruction in ACCURATE mode, built-in OCR; written incrementally in 40-page batches and resumable after interruption); images are described by the Ollama VL model as `[Image]: <description>` paragraphs; after each fresh conversion, table flattening runs automatically (see `flatten_md_tables.py` below). For spreadsheets run `python convert_sheets.py` instead → each sheet becomes a `# {filename} — Sheet: {name}` section with one `### {row}` block per data row (same block convention as the flattened PDF tables; no flattening step needed)
-3. **Review / edit the Markdown in `md_review/`** — this is the quality gate before anything is indexed
-4. Move the finalized `.md` into `my_shared_docs/{project_id}/` — the move itself is the approval signal
-5. Run `python ingest_docs.py` (md/txt only): dotted clause list lines (`- 10.3.6 The ...`) are first promoted to `### <id>` headers in memory (never touching the files on disk) so each clause becomes its own retrieval unit, then `MarkdownHeaderTextSplitter` splits by H1–H3, Parents (12000/0) and Children (300/50); embedding text = header breadcrumb + Child content, vectorized by bge-m3; idempotent uuid5 point IDs are upserted into the `kilo-projects-info` collection, with keyword payload indexes on `project_id`, `parent_ref_ids` (own section/clause IDs on the breadcrumb path) and `mentioned_refs` (IDs referenced in the parent text). Each file's previous points are deleted (filter: project + source) right before its upsert, so re-ingesting an edited file leaves no stale chunks
-
-### Query Flow
-
-1. Reference IDs in the query (`PS 10.3.6`, `Clause 10.3.11(d)`, `Section 23`, `Schedule 3`, `Sch.1`, `SC No. 1`, `TC2-T3`, `2400-01`) are detected and normalized (bare dotted/alphanumeric tokens only after an existence check against the index, so standards like `IEC 60502-1` are ignored); an explicit `ref` parameter overrides detection
-2. Exact ref matches come first: deep clause IDs (≥3 segments) and alphanumeric item IDs return their own clause parent; section/schedule/2-segment IDs vector-rank children within that section and return its top clauses
-3. Remaining slots (up to `target_parents`) are filled with plain vector results, deduplicated against the exact hits; hits from exact matches are tagged `matched_refs`
-4. When exact matches exist, a `Referenced by:` block lists the source files mentioning the matched ID (reverse citation lookup for compliance work)
-5. The query is vectorized by bge-m3, results are filtered by `project_id` (automatically includes `global`), over-fetched `target_parents * 5`, deduplicated by `parent_id`, and complete Parent sections returned (default 3); if Ollama is not running, returns a `[Search failed]` message and the MCP Server does not crash
-
-### Key Features
-
-- **Parent-Child (Small-to-Big) retrieval**: small chunks (Children) are used for semantic matching, and complete large sections (Parents) are returned
-- **Section-ID search**: compliance-style references (`PS 10.3.6`, `Section 23`, `Schedule 3`, `TC2-T3`) are matched exactly against indexed clause/section IDs and returned as the first hit, with a Referenced-by reverse citation block — no vocabulary guessing needed; pure-text queries keep the unchanged vector behavior
-- **Clause-level parents**: dotted clause list lines are promoted to headers at ingest time (in memory only), so a clause like 10.3.6 is its own retrieval unit instead of being buried in a section grab-bag
-- **Header-aware chunking**: sections split by Markdown headers; embedding text includes the `H1 > H2 > H3` breadcrumb
-- **Docling preprocessing**: table structure reconstruction and OCR, with resumable batch conversion and a review gate before ingestion
-- **Image descriptions (Ollama VL)**: images found in converted PDFs are described by a local vision-language model (`qwen3.8:27b-mlx`); each `<!-- image -->` placeholder becomes an `[Image]: <description>` paragraph, so image content is searchable. If Ollama or the model is unavailable, the placeholder is kept and the conversion still completes
-- **Table flattening**: pipe tables (e.g. Item/Question/Reply tender clarifications) are rewritten into one `### {Item ID}` Q&A block per row, so each Q&A becomes a self-contained retrieval unit; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated page headers deduplicated, and HTML entities unescaped. Headerless tables are flattened without invented labels (truncated first-column titles, plain-text lines)
-- **Idempotent reruns**: point IDs are derived from filename and chunk indices; rerunning overwrites old data instead of stacking duplicates
-- **Ollama failure tolerance**: friendly error messages on query failure; the MCP Server keeps running
-
-### Directory Overview
-
-- `pdf_inbox/` — Drop PDFs and Excel/CSV spreadsheets to convert here (root = `global`, first-level subfolders = `project_id`)
-- `md_review/` — Conversion output awaiting review; edit here, then move the finalized `.md` into `my_shared_docs/`
-- `my_shared_docs/` — Approved document source (root = `global`, first-level subfolders = `project_id`)
-- `converted_md/` — Legacy conversion cache from the old single-script workflow (safe to delete; keep `02-Particular-Specification-points-list.md` if still needed)
-- `qdrant_storage/` — Qdrant data directory (Docker bind mount)
-- `rag_core.py` — Shared workflow core (used by CLI, MCP server and web API)
-- `ref_ids.py` — Reference-ID model for section-ID search (promotion, ID extraction, query normalization)
-- `convert_pdfs.py` — PDF→Markdown conversion script (review gate)
-- `convert_sheets.py` — Excel/CSV→Markdown conversion script (review gate)
-- `sheet_to_md.py` — Spreadsheet→Markdown module (header detection, merged-cell expansion, per-row blocks)
-- `flatten_md_tables.py` — Table flattening script (auto-run after fresh conversions; `python flatten_md_tables.py md_review/` migrates existing files in place)
-- `ingest_docs.py` — Ingestion script (documents → chunks → vectors → Qdrant)
-- `rag_mcp_server.py` — MCP Server (provides the retrieval tool)
-- `api/` — FastAPI app (`api/app.py`) + job manager (`api/jobs.py`) for the web UI
-- `web/` — Next.js web UI (see Web UI below)
+A locally hosted RAG knowledge base and MCP Server that lets AI coding agents such as Kilo retrieve shared cross-project documents (e.g. specifications, technical docs) directly via the MCP tool `search_shared_knowledge`, without pasting document contents into the conversation. All components (Qdrant, Ollama) run locally, so document contents are never sent to any external API. Documents are isolated per project by `project_id`; querying a specific project automatically includes the root-level `global` shared documents.
 
 ## Prerequisites
 
 - Docker (to run the Qdrant container)
 - Ollama running with the embedding model pulled: `ollama pull bge-m3`
-- For image descriptions in converted PDFs: `ollama pull qwen3.8:27b-mlx` (optional; conversion works without it, image placeholders are kept)
+- Optional models: `ollama pull embeddinggemma-2` (visual retrieval), `ollama pull qwen3.8:27b-mlx` (image descriptions in converted PDFs)
 - Python venv with dependencies installed: `pip install -r requirements.txt`
 - Node.js (only for the optional web UI)
 
----
-
-## Ingest Documents
-
-### Adding Shared Documents
-
-For Markdown/text files, put them directly into `my_shared_docs/{project-id}/` (supports `.md`, `.txt`).
-
-For PDFs and Excel/CSV spreadsheets, go through the conversion + review workflow first:
-
-1. Put the PDFs into `pdf_inbox/{project-id}/`
-2. Convert them to reviewable Markdown (tables are flattened automatically right after the conversion):
+## Start Server
 
 ```bash
-python convert_pdfs.py
+docker compose up -d
 ```
 
-3. Review / edit the generated Markdown in `md_review/{project-id}/`
-4. Move the finalized `.md` files into `my_shared_docs/{project-id}/`
+Starts the whole stack: Qdrant (pinned `v1.19.1`), the FastAPI backend (`api/`, Docling included), and the web UI. Ollama is expected on the host (models: `bge-m3`, `qwen3.8:27b-mlx`, `embeddinggemma-2` for visual retrieval).
+
+- Web UI: http://localhost:3300 (change the `web` port mapping in `docker-compose.yml` if needed)
+- Qdrant dashboard: http://localhost:6333/dashboard
+
+## Add & Ingest Documents
+
+Markdown/text files (`.md`, `.txt`): put them directly into `my_shared_docs/{project-id}/`.
+
+PDFs and Excel/CSV spreadsheets (`.xlsx`/`.xlsm`/`.csv`) go through conversion + review first:
+
+1. Drop the files into `pdf_inbox/{project-id}/` (root-level files = `global`)
+2. Convert them to reviewable Markdown:
+
+```bash
+python convert_pdfs.py     # PDFs (tables flattened automatically right after conversion)
+python convert_sheets.py   # Excel/CSV
+```
+
+3. **Review / edit the generated Markdown in `md_review/{project-id}/`** — this is the quality gate before anything is indexed
+4. Move the finalized `.md` files into `my_shared_docs/{project-id}/` — the move itself is the approval signal
 5. Run the ingestion script (chunks files, generates vectors, and uploads to Qdrant):
 
 ```bash
 python ingest_docs.py
 ```
 
-For Excel/CSV spreadsheets (`.xlsx`, `.xlsm`, `.csv`), the same workflow applies with the sheet converter:
-
-1. Put the files into `pdf_inbox/{project-id}/` (same two-level layout; extension decides which script handles the file)
-2. Convert them to per-row Markdown blocks:
+6. *(Optional)* Index the approved PDFs' pages as images for visual retrieval:
 
 ```bash
-python convert_sheets.py
+python index_pages.py
 ```
 
-3. Review / edit in `md_review/{project-id}/`, move the finalized `.md` into `my_shared_docs/{project-id}/`, then run `python ingest_docs.py` as above
-
-### Notes
-
-- **Review gate**: nothing from a PDF is indexed until you move its reviewed `.md` into `my_shared_docs/`; the move is the approval signal
-- **Table flattening**: after a fresh conversion, pipe tables are rewritten into per-row `### {Item ID}` Q&A blocks with `[Question]:`/`[Reply]:` label lines; cross-page continuation rows are merged per column, `(Cont'd)` rows folded into their base item, repeated table headers dropped, merged-cell title rows collapsed, and item-code-fused rows (e.g. `TC1-C2 Please advise...`) split back into ID + text. Files that are up to date are never re-flattened, so manual review edits are safe; the flatten step is idempotent. Known limitation: Docling-level column fusion / word-order errors (e.g. a reply starting with "terms after the") cannot be auto-repaired — fix them during review. Existing `md_review/` files can be migrated in place: `python flatten_md_tables.py md_review/`
-- **Conversion resume**: conversion is written incrementally in 40-page batches and automatically resumes from where it left off after interruption; a finished review md is reused when the source PDF is unchanged (manual edits preserved). If the PDF changes, the old review md is backed up as `{name}.md.prev` and the PDF is reconverted. If the finalized md already exists in `my_shared_docs/`, the PDF is skipped entirely
-- **Image descriptions**: each image is sent to the local Ollama VL model (`qwen3.8:27b-mlx`, configurable via `VL_MODEL` in `rag_core.py`) and its description replaces the `<!-- image -->` placeholder. Image-heavy PDFs take considerably longer to convert; a failed description (Ollama down, model missing) keeps the placeholder without aborting the conversion
-- **First run**: Docling needs to download models (several hundred MB); converting large PDFs (hundreds of pages) may take tens of minutes
-- **Spreadsheet conversion** (`convert_sheets.py`): each sheet becomes a `# {filename} — Sheet: {name}` section; the header is detected as the first row within the first 10 non-empty rows where all non-empty cells are short labels (≤40 chars) — non-empty rows above it are kept as a plain-text preamble. Each data row becomes one `### {first column}` block with `[Column]: value` label lines, mirroring `flatten_md_tables.py`; headerless sheets get plain-text lines with no invented labels; titles longer than 60 chars are truncated with `…` and kept in full inside the block. Merged cells are expanded to their anchor value in every covered row; hidden sheets are converted with a `(hidden)` marker; empty sheets are skipped. CSV files are decoded via `utf-8-sig` → `utf-16` → `big5` with auto-detected delimiters (`,`/tab/`;`). Formulas are read as their Excel cached values (a file never calculated and saved by Excel yields empty cells — fill them during review); numbers keep raw values (no currency/percent formatting); only the first detected header per sheet is used, so multi-table sheets need review. `.xls`/`.ods` are not supported — save as `.xlsx` first. Known limitation: within the same project, a `.pdf` and a spreadsheet sharing the same stem map to the same review md (`{stem}.md`), so whichever converts later replaces the other (old copy kept as `{stem}.md.prev`)
-- **PDFs in `my_shared_docs/`**: `ingest_docs.py` does not ingest PDFs directly; it prints a warning and skips them
-- **Safe to rerun**: chunk IDs are derived from `filename + chunk index`; rerunning the same file overwrites old data instead of stacking duplicates
-- **Changed file content**: each file's previous points are deleted (by `project_id` + `source` filter) right before the new upsert, so editing a file and rerunning leaves no stale chunks. Recreating the whole collection is only needed after chunking-format changes:
-```bash
-curl -X DELETE http://localhost:6333/collections/kilo-projects-info
-python ingest_docs.py
-```
-or simply `python ingest_docs.py --rebuild`
-
----
-
-## Web UI (optional)
-
-A local web app wraps the whole CLI workflow: dashboard with Qdrant/Ollama health badges and project cards, multi-file upload (`.pdf`/`.xlsx`/`.xlsm`/`.csv` → inbox, `.md`/`.txt` → approved docs), Docling conversion with live progress bars plus spreadsheet conversion into per-row `###` blocks ("Convert all pending" handles both in one job), a CodeMirror Markdown review editor with preview, Approve / Approve & Ingest actions, per-file and per-project (re-)ingest with chunk counts, a read-only viewer for approved docs, and a search tab mirroring the MCP retrieval.
-
-### Run
-
-Either via Docker (everything at once — see [Start Server](#start-server)):
-
-```bash
-docker compose up -d   # web UI on http://localhost:3300
-```
-
-…or as two dev processes:
-
-1. Start the backend (from `rag/`, single process only — the job queue lives in it):
-
-```bash
-.venv/bin/python -m uvicorn api.app:app --port 8100
-```
-
-2. Start the frontend (from `rag/web/`):
-
-```bash
-npm install
-npm run dev
-```
-
-3. Open http://localhost:3000 — the Next.js dev server proxies `/api/*` to `127.0.0.1:8100`. If port 3000 is taken (e.g. by a Docker port mapping), run `npm run dev -- --port 3100` and open http://localhost:3100 (the API allows both origins).
-
-### Notes
-
-- **Jobs**: conversions and ingestions run in a single background worker thread (FIFO) inside the FastAPI process; the frontend polls job status ~1×/s. The in-memory job registry is lost on restart — that is fine, because PDF conversion resumes from its `.progress` sidecar files and ingestion is idempotent
-- **Concurrent edit protection**: while a conversion job is queued or running for a review file, saving that file from the editor returns 409 (protects the flatten/review flow)
-- **Project rename is not supported** (uuid5 point IDs embed the project_id); delete and recreate instead
-- **`global`** is a virtual scope (root-level files); it always appears on the dashboard and cannot be created or deleted as a project
-
----
+Detailed notes and known limitations: [docs/INGEST.md](docs/INGEST.md)
 
 ## RAG MCP Setup
+
 The MCP server config currently lives only in rag/kilo.json. Other projects that want to call this tool need to add the same config to their kilo.json (or the global ~/.config/kilo/kilo.json):
+
 ```jsonc
 {
   "mcp": {
@@ -201,18 +69,20 @@ The MCP server config currently lives only in rag/kilo.json. Other projects that
 ```
 
 ### Making Each Project Automatically Pass Its Own project_id
-Add a rule to each project's AGENTS.md, e.g. in the clpe-cdhk project:
-`Always call search_shared_knowledge with project_id="clpe-cdhk".`
 
-### Section-ID Search
+Add a rule to each project's AGENTS.md, e.g. for a project whose documents live in `my_shared_docs/my-project/`:
+`Always call search_shared_knowledge with project_id="my-project".`
 
-The `search_shared_knowledge` tool recognizes section/clause references directly in `query`, or explicitly via the optional `ref` parameter:
+Section-ID search reference: [docs/MCP.md](docs/MCP.md)
 
-| Query surface | Canonical ID | Behavior |
-| --- | --- | --- |
-| `PS 10.3.6`, `Clause 10.3.11(d)`, `10.4.8` | `10.3.6`, `10.3.11`(+sub `d`), `10.4.8` | ≥3-segment clause: returns that exact clause parent first |
-| `Section 23`, `Section 25` | `23`, `25` | vector-ranks clauses within that section |
-| `Schedule No. 3`, `Schedule 3`, `Sch.1`, `SC No. 1`, `SOR Schedule Nr. 3` | `schedule-3`, `schedule-1` | vector-ranks clauses within that schedule |
-| `TC2-T3`, `TQ-T8-1`, `2400-01` | verbatim lowercase | returns that exact item's block first |
+## Web UI (optional)
 
-Exact hits are tagged `[Exact ref match: <id>]` and followed by normal semantic results; a `Referenced by:` block lists sources mentioning the matched ID. Bare dotted/alphanumeric tokens are only trusted when the ID exists in the index (so `IEC 60502-1` never matches). Letter sub-items (`10.3.11(d)`) resolve to the containing clause.
+Included in the docker stack above (http://localhost:3300). For development as two dev processes (FastAPI + Next.js), see [docs/WEB_UI.md](docs/WEB_UI.md).
+
+## Further Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, ingest/query data flow, key features, directory overview
+- [docs/INGEST.md](docs/INGEST.md) — detailed ingestion notes (review gate, table flattening, resume, spreadsheets, reruns)
+- [docs/MCP.md](docs/MCP.md) — Section-ID search reference
+- [docs/WEB_UI.md](docs/WEB_UI.md) — web UI features, dev setup, notes
+- [docs/VISUAL_RETRIEVAL.md](docs/VISUAL_RETRIEVAL.md) — page-as-image retrieval (indexing, searching, eval)
