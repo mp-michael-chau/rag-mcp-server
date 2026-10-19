@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY rag_core.py flatten_md_tables.py ref_ids.py sheet_to_md.py convert_pdfs.py convert_sheets.py ingest_docs.py rag_mcp_server.py ./
+COPY rag_core.py flatten_md_tables.py ref_ids.py sheet_to_md.py convert_pdfs.py convert_sheets.py ingest_docs.py index_pages.py rag_mcp_server.py ./
 COPY api ./api
 
 EXPOSE 8100

@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -31,6 +31,7 @@ from api.jobs import JobManager
 
 STAGE_DIRS = {"inbox": rag_core.PDF_INBOX_DIR, "review": rag_core.MD_REVIEW_DIR, "docs": rag_core.DOCS_DIR}
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+PAGE_IMAGE_RE = re.compile(r"^page-\d{4,}\.png$")  # rendered page PNGs: page-{nnnn}.png
 HIDDEN_SUFFIXES = rag_core.SIDECAR_SUFFIXES  # single source: rag_core (+ flatten_md_tables)
 SHEET_EXTS = rag_core.SHEET_EXTS  # single source: rag_core (.xlsx/.xlsm/.csv)
 CONVERTIBLE_EXTS = (".pdf", *SHEET_EXTS)  # inbox extensions a convert job may target
@@ -166,6 +167,8 @@ def delete_project(project_id: str):
     # delete can simply be retried (the project stays visible); the reverse order would
     # orphan the points with no UI path left to remove them.
     rag_core.delete_points(project_id=pid)
+    rag_core.delete_points_pages(project_id=pid)
+    rag_core.delete_page_pngs(pid)
     for base in STAGE_DIRS.values():
         folder = Path(rag_core.project_dir(base, pid))
         if folder.is_dir():
@@ -264,8 +267,10 @@ def delete_document(project_id: str, stage: str, name: str):
     pid = check_project_id(project_id)
     if stage not in STAGE_DIRS:
         raise HTTPException(400, f"Invalid stage: {stage} (expected one of {sorted(STAGE_DIRS)})")
-    if stage == "docs" and job_manager.blocks_document_delete(pid, name):
-        raise HTTPException(409, "An ingest job is targeting this document; wait for it to finish before deleting")
+    # docs: ingest/index_pages jobs upsert points for this document; inbox: index_pages renders
+    # this PDF (deleting it mid-job would orphan or abort the indexing)
+    if stage in ("docs", "inbox") and job_manager.blocks_document_delete(pid, name):
+        raise HTTPException(409, "A job is targeting this document; wait for it to finish before deleting")
     path = safe_file_path(STAGE_DIRS[stage], pid, name)
     if not path.is_file():
         raise HTTPException(404, f"File not found: {stage}/{name}")
@@ -276,6 +281,8 @@ def delete_document(project_id: str, stage: str, name: str):
             sidecar.unlink()
     if stage == "docs":
         rag_core.delete_points(project_id=pid, source=name)
+        rag_core.delete_points_pages(project_id=pid, source=name)
+        rag_core.delete_page_pngs(pid, name)  # remove the document's rendered page PNG dir too
     return {"deleted": name, "stage": stage}
 
 
@@ -333,11 +340,32 @@ def approve(project_id: str, name: str, overwrite: int = Query(0)):
     return {"approved": name}
 
 
+# --- page images (visual retrieval thumbnails) ---
+
+
+@app.get("/api/projects/{project_id}/pages/{stem}/{page}")
+def get_page_image(project_id: str, stem: str, page: str):
+    """Serve a rendered page PNG from pages/{project_id}/{stem}/ (path-safe: stem is validated,
+    page must be page-{nnnn}.png, and the resolved target must stay under PAGES_DIR)."""
+    pid = check_project_id(project_id)
+    if not stem or stem.startswith(".") or "/" in stem or "\\" in stem:
+        raise HTTPException(400, f"Invalid document stem: {stem!r}")
+    if not PAGE_IMAGE_RE.fullmatch(page):
+        raise HTTPException(400, f"Invalid page image name: {page!r} (expected page-0001.png)")
+    base = Path(rag_core.PAGES_DIR).resolve()
+    target = (base / pid / stem / page).resolve()
+    if base not in target.parents:
+        raise HTTPException(400, "Path escapes the pages directory")
+    if not target.is_file():
+        raise HTTPException(404, f"Page image not found: {stem}/{page}")
+    return FileResponse(str(target), media_type="image/png")
+
+
 # --- jobs ---
 
 
 class JobCreate(BaseModel):
-    type: str  # "convert" | "ingest"
+    type: str  # "convert" | "ingest" | "index_pages"
     project_id: str | None = None  # omit / "all" for the whole library
     name: str | None = None  # specific file; omit for the whole project
 
@@ -353,8 +381,8 @@ def _check_job_name(pid: str, name: str, stage: str, extensions: tuple[str, ...]
 
 @app.post("/api/jobs", status_code=201)
 def create_job(body: JobCreate):
-    if body.type not in ("convert", "ingest"):
-        raise HTTPException(400, "type must be 'convert' or 'ingest'")
+    if body.type not in ("convert", "ingest", "index_pages"):
+        raise HTTPException(400, "type must be 'convert', 'ingest' or 'index_pages'")
     scope_all = body.project_id in (None, "", "all")
     pid = None if scope_all else check_project_id(body.project_id)
 
@@ -364,6 +392,13 @@ def create_job(body: JobCreate):
         elif pid is None and body.name:
             raise HTTPException(400, "project_id is required when converting a specific file")
         return _submit_convert(pid, body.name).to_dict()
+    if body.type == "index_pages":
+        # page indexing renders the inbox PDF, gated on its approved md (checked again at run time)
+        if pid is not None and body.name:
+            _check_job_name(pid, body.name, "inbox", (".pdf",))
+        elif pid is None and body.name:
+            raise HTTPException(400, "project_id is required when indexing a specific file")
+        return _submit_index_pages(pid, body.name).to_dict()
     if pid is not None and body.name:
         _check_job_name(pid, body.name, "docs", (".md", ".txt"))
     elif pid is None and body.name:
@@ -464,6 +499,49 @@ def _submit_ingest(pid, name):
     return job_manager.submit("ingest", run, target=f"ingest {pid} (project)", project_id=pid)
 
 
+def _index_pages_progress_cb(ctx):
+    def cb(done, total):
+        ctx.set_progress(f"{done}/{total} pages")
+    return cb
+
+
+def _submit_index_pages(pid, name):
+    if pid is None:
+        def run(ctx):
+            ctx.log("Indexing page images for all approved PDFs")
+            rag_core.ensure_page_collection()
+            rag_core.index_pages_all(progress_cb=_index_pages_progress_cb(ctx))
+            ctx.log("Page indexing finished")
+
+        return job_manager.submit("index_pages", run, target="index pages all projects")
+    if name:
+        src = Path(rag_core.project_dir(rag_core.PDF_INBOX_DIR, pid)) / name
+        if not src.is_file():
+            raise HTTPException(404, f"Inbox PDF not found: {name}")
+
+        def run(ctx):
+            ctx.log(f"Indexing pages of {pid}/{name}")
+            rag_core.ensure_page_collection()
+            result = rag_core.index_pages_file(pid, name, progress_cb=_index_pages_progress_cb(ctx))
+            ctx.log(result["message"])
+
+        return job_manager.submit("index_pages", run, target=f"index pages {pid}/{name}", project_id=pid, name=name)
+
+    def run(ctx):
+        rag_core.ensure_page_collection()
+        sources = [
+            (p, fn) for (p, fn, _fp) in rag_core.scan_doc_sources(rag_core.PDF_INBOX_DIR)
+            if p == pid and fn.lower().endswith(".pdf") and rag_core.finalized_md_path(p, fn)
+        ]
+        ctx.log(f"{len(sources)} approved PDF(s) to index in {pid}")
+        for i, (p, fn) in enumerate(sources, 1):
+            ctx.log(f"[{i}/{len(sources)}] Indexing pages of {p}/{fn}")
+            result = rag_core.index_pages_file(p, fn, progress_cb=_index_pages_progress_cb(ctx))
+            ctx.log(result["message"])
+
+    return job_manager.submit("index_pages", run, target=f"index pages {pid} (project)", project_id=pid)
+
+
 @app.get("/api/jobs")
 def list_jobs(active: int = Query(0)):
     return {"jobs": [j.to_dict() for j in job_manager.list(active_only=bool(active))]}
@@ -518,7 +596,8 @@ class SearchRequest(BaseModel):
     query: str
     project_id: str | None = None
     target_parents: int = 3
-    ref: str | None = None  # explicit section/clause/schedule/item ID override ("10.3.6", "Schedule 3")
+    ref: str | None = None  # explicit section/clause/schedule/item ID override ("1.2.3", "Schedule 2")
+    include_pages: bool | None = None  # page-image matches; None → server default (ENABLE_VISUAL env, on)
 
 
 @app.post("/api/search")
@@ -527,7 +606,8 @@ def search(body: SearchRequest):
         raise HTTPException(400, "query must not be empty")
     try:
         result = rag_core.search_full(
-            body.query, project_id=body.project_id, target_parents=body.target_parents, ref=body.ref
+            body.query, project_id=body.project_id, target_parents=body.target_parents,
+            ref=body.ref, include_pages=body.include_pages
         )
     except RuntimeError as e:
         raise HTTPException(502, str(e))
@@ -540,4 +620,5 @@ def search(body: SearchRequest):
         "results": result["hits"],  # exact ref matches carry an extra "matched_refs" list
         "notes": result["notes"],
         "referenced_by": result["referenced_by"],
+        "pages": result["pages"],  # page-image matches (visual retrieval); [] when disabled/unavailable
     }

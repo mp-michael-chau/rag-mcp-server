@@ -2,24 +2,24 @@
 
 Pure functions, stdlib only. Responsibilities:
 
-1. normalize_query_refs(text): extract reference tokens ("PS 10.3.6",
-   "Clause 10.3.11(d)", "Section 23", "Schedule 3", "Sch.1", "SC No. 1",
-   "TC2-T3", bare "10.4.8") into canonical lowercase IDs. Prefixed forms are
+1. normalize_query_refs(text): extract reference tokens ("PS 1.2.3",
+   "Clause 1.2.3(d)", "Section 12", "Schedule 2", "Sch.4", "SC No. 2",
+   "AB1-C2", bare "1.4.8") into canonical lowercase IDs. Prefixed forms are
    certain; bare dotted/alphanumeric forms are flagged "bare" so the caller
    can existence-check them against the index before trusting them.
 2. promote_clause_headers(content): insert a "### <id>" line immediately above
-   dotted clause list lines ("- 10.3.6 The ...") so each clause becomes its own
+   dotted clause list lines ("- 1.2.3 The ...") so each clause becomes its own
    parent at ingest time. In-memory only — source files are never modified.
 3. extract_header_ref_ids(breadcrumb) / extract_mentioned_refs(text): derive
    the payload fields parent_ref_ids (own IDs on the breadcrumb path) and
    mentioned_refs (reference-shaped tokens in the parent body text).
 
 Canonical forms (stored lowercase in Qdrant payload arrays):
-- dotted numeric (>=2 segments): verbatim ("10.3.6"); a letter sub-item is
-  stripped and reported separately ("10.3.11(d)" -> id "10.3.11", sub "d")
-- top-level section: bare integer ("23")
-- named schedule: "schedule-3", "schedule-1"
-- alphanumeric row/item IDs: verbatim lowercase ("tc2-t3", "tq-t8-1", "2400-01")
+- dotted numeric (>=2 segments): verbatim ("1.2.3"); a letter sub-item is
+  stripped and reported separately ("1.2.3(d)" -> id "1.2.3", sub "d")
+- top-level section: bare integer ("12")
+- named schedule: "schedule-2", "schedule-4"
+- alphanumeric row/item IDs: verbatim lowercase ("ab1-c2", "xy9-z8", "1234-56")
 """
 
 import re
@@ -27,15 +27,15 @@ import re
 # --- prefix words (longest first so alternation prefers the longest match) ---
 
 _PREFIX_WORDS = (
-    "sor schedule nr",  # SOR Schedule Nr. 3
-    "schedule no",      # Schedule No. 3
-    "schedule nr",      # Schedule Nr. 3
-    "sc no",            # SC No. 1
-    "schedule",         # Schedule 3
-    "section",          # Section 23
-    "sch",              # Sch.1 / Sch 1 / Sch. No. 1
-    "clause",           # Clause 10.3.11(d)
-    "ps",               # PS 10.3.6
+    "sor schedule nr",  # SOR Schedule Nr. 2
+    "schedule no",      # Schedule No. 2
+    "schedule nr",      # Schedule Nr. 2
+    "sc no",            # SC No. 2
+    "schedule",         # Schedule 2
+    "section",          # Section 12
+    "sch",              # Sch.4 / Sch 4 / Sch. No. 4
+    "clause",           # Clause 1.2.3(d)
+    "ps",               # PS 1.2.3
 )
 
 _SCHEDULE_PREFIXES = {"sor schedule nr", "schedule no", "schedule nr", "sc no", "schedule", "sch"}
@@ -144,7 +144,7 @@ def normalize_query_refs(text):
      "raw": matched text, "sub": letter sub-item or None}
     Prefixed forms are certain (bare=False); bare dotted/alphanumeric tokens
     are candidates (bare=True) that the caller should existence-check against
-    parent_ref_ids before using (kills false positives like "IEC 60502-1").
+    parent_ref_ids before using (kills false positives like "IEC 61010-1").
     Duplicate ids are dropped, keeping the non-bare (certain) occurrence.
     """
     tokens = _prefixed_tokens(text)
@@ -172,8 +172,8 @@ def promote_clause_headers(content):
     line a single-line clause would become an empty section).
 
     Requiring >=2 dotted segments excludes PDF-conversion artifacts like
-    "2. (a) Carbon Dioxide Sensor;" (numbered, not dashed) and prose decimals
-    ("1.5 mm²", "IEC 60502-1:2004" — never list lines starting with the id).
+    "2. (a) Some numbered artifact;" (numbered, not dashed) and prose decimals
+    ("1.5 mm²", "IEC 61010-1:2004" — never list lines starting with the id).
     Also demotes short letter/number subsection headers ("## (A) General") to
     H3 so they nest under their parent section (see _LETTER_HEADER_RE).
     Idempotent: a line whose predecessor is already the same promoted header
@@ -224,8 +224,8 @@ def extract_header_ref_ids(breadcrumb):
     the breadcrumb path ("H1 > H2 > H3"), plus the ancestor prefixes of each
     dotted ID ("23.1" also yields "23") — H2 subsections are siblings of their
     parent section in this corpus, so the ancestor is often not literally on
-    the path. Children of clause 10.3.6 get ["10", "10.3", "10.3.6"]; children
-    under "(Optional) Schedule No. 3 ..." get ["schedule-3"]."""
+    the path. Children of clause 1.2.3 get ["1", "1.2", "1.2.3"]; children
+    under "(Optional) Schedule No. 2 ..." get ["schedule-2"]."""
     ids = []
     if not breadcrumb:
         return ids
@@ -247,9 +247,9 @@ def extract_header_ref_ids(breadcrumb):
 
 def extract_mentioned_refs(text):
     """Reference-shaped canonical IDs mentioned in parent body text: prefixed
-    refs ("clause 10.3.3", "PS 22.5", "Section 25"), their comma/dash
-    continuations ("PS 10.3.1(d), 10.3.12"), schedules ("Schedule No. 1(B)(a)"
-    -> "schedule-1") and alphanumeric IDs ("2400-01", "TQ-T8-1"). Bare dotted
+    refs ("clause 1.2.1", "PS 4.5", "Section 15"), their comma/dash
+    continuations ("PS 1.2.1(d), 1.2.12"), schedules ("Schedule No. 2(B)(a)"
+    -> "schedule-2") and alphanumeric IDs ("1234-56", "xy9-z8"). Bare dotted
     numbers without a prefix are deliberately NOT extracted (over-extraction
     is tolerable here, but bare decimals are pure noise)."""
     ids = []

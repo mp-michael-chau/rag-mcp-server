@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, type ProjectSummary, type SearchHit } from "@/lib/api";
+import { api, type PageMatch, type ProjectSummary, type SearchHit } from "@/lib/api";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,7 @@ export default function SearchPage() {
   const [targetParents, setTargetParents] = useState(3);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [results, setResults] = useState<SearchHit[] | null>(null);
+  const [pages, setPages] = useState<PageMatch[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -30,7 +31,7 @@ export default function SearchPage() {
     setBusy(true);
     setError(null);
     try {
-      const data = await api<{ results: SearchHit[] }>("/api/search", {
+      const data = await api<{ results: SearchHit[]; pages?: PageMatch[] }>("/api/search", {
         method: "POST",
         body: JSON.stringify({
           query,
@@ -39,9 +40,11 @@ export default function SearchPage() {
         }),
       });
       setResults(data.results);
+      setPages(data.pages ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setResults(null);
+      setPages(null);
     } finally {
       setBusy(false);
     }
@@ -109,8 +112,45 @@ export default function SearchPage() {
         </Alert>
       )}
 
-      {results !== null && results.length === 0 && (
+      {results !== null && results.length === 0 && (pages?.length ?? 0) === 0 && (
         <p className="text-sm text-muted-foreground">No relevant information found.</p>
+      )}
+
+      {pages !== null && pages.length > 0 && (
+        <section className="mb-5">
+          <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            Page matches ({pages.length})
+          </h2>
+          <div className="flex flex-wrap gap-3">
+            {pages.map((p, i) => {
+              const segs = p.page_image.split("/");
+              const file = segs[segs.length - 1];
+              const stem = segs.slice(1, -1).join("/");
+              const url = `/api/projects/${encodeURIComponent(p.project_id)}/pages/${encodeURIComponent(stem)}/${file}`;
+              return (
+                <a
+                  key={`${p.source}-${p.page_number}-${i}`}
+                  href={url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group w-48 overflow-hidden rounded-lg border bg-card transition-colors hover:border-primary/50"
+                  title={`${p.source} — page ${p.page_number} (click to open full image)`}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element -- served by the local API, not the image optimizer */}
+                  <img src={url} alt={`${p.source} page ${p.page_number}`} loading="lazy" className="h-40 w-full object-cover object-top" />
+                  <div className="flex flex-col gap-0.5 px-2 py-1.5 text-xs">
+                    <span className="truncate font-mono" title={p.source}>
+                      {p.source.replace(/\.pdf$/i, "")}
+                    </span>
+                    <span className="text-muted-foreground">
+                      p.{p.page_number} · {(p.score * 100).toFixed(0)}% match
+                    </span>
+                  </div>
+                </a>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       <div className="flex flex-col gap-4">
