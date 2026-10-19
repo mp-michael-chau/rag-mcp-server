@@ -10,6 +10,7 @@ qdrant_storage/
 my_shared_docs/
 pdf_inbox/
 md_review/
+pages/
 
 # Web UI
 web/node_modules/

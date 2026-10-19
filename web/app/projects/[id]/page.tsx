@@ -303,10 +303,10 @@ export default function ProjectPage() {
   const inbox = documents.filter((d) => d.stage === "inbox");
   const review = documents.filter((d) => d.stage === "review");
   const docs = documents.filter((d) => d.stage === "docs");
-  const projBusy = (type: "convert" | "ingest") =>
+  const projBusy = (type: "convert" | "ingest" | "index_pages") =>
     active.some((j) => j.type === type && j.project_id === projectId && j.name === null) ||
     active.some((j) => j.type === type && j.project_id === null);
-  const fileBusy = (type: "convert" | "ingest", name: string) => isTargeted(type, projectId, name);
+  const fileBusy = (type: "convert" | "ingest" | "index_pages", name: string) => isTargeted(type, projectId, name);
 
   return (
     <div>
@@ -335,6 +335,16 @@ export default function ProjectPage() {
           >
             Ingest project
           </Button>
+          {inbox.some((d) => d.kind === "pdf" && d.already_approved) && (
+            <Button
+              variant="outline"
+              onClick={() => void enqueue({ type: "index_pages", project_id: projectId })}
+              disabled={projBusy("index_pages")}
+              title="Render every approved PDF's pages and embed them for page-image search (EmbeddingGemma 2)"
+            >
+              Index pages
+            </Button>
+          )}
         </div>
       </div>
 

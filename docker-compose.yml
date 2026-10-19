@@ -1,7 +1,7 @@
 # docker-compose.yml
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.19.1  # pinned (Hub tags are v-prefixed); >=1.15 for query_points. Matches the running server's storage format.
     container_name: qdrant_rag
     ports:
       - "6333:6333" # HTTP API & Web UI
@@ -26,6 +26,7 @@ services:
       - ./pdf_inbox:/app/pdf_inbox
       - ./md_review:/app/md_review
       - ./my_shared_docs:/app/my_shared_docs
+      - ./pages:/app/pages # rendered page PNGs (visual retrieval thumbnails + re-embed source)
       - model-cache:/root/.cache # Docling/RapidOCR/HF models — keep across container rebuilds
     depends_on:
       - qdrant

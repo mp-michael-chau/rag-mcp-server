@@ -59,7 +59,7 @@ export interface DocumentItem {
 
 export interface Job {
   id: string;
-  type: "convert" | "ingest";
+  type: "convert" | "ingest" | "index_pages";
   target: string;
   project_id: string | null;
   name: string | null;
@@ -78,6 +78,17 @@ export interface SearchHit {
   source: string;
   headers: string;
   text: string;
+}
+
+/** Page-image match (visual retrieval); order is RRF-fused with the text ranking,
+ *  score is the raw page-image cosine similarity. */
+export interface PageMatch {
+  project_id: string;
+  source: string;
+  page_number: number;
+  score: number;
+  /** PNG path inside pages/, e.g. "clpe-cdhk/Spec/page-0031.png" */
+  page_image: string;
 }
 
 export async function uploadFiles(

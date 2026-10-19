@@ -27,7 +27,7 @@ SUBSCRIBER_MAXSIZE = 1000  # per-subscriber event backlog; overflow drops (recon
 class Job:
     def __init__(self, job_type, target, project_id=None, name=None):
         self.id = uuid.uuid4().hex[:12]
-        self.type = job_type  # "convert" | "ingest"
+        self.type = job_type  # "convert" | "ingest" | "index_pages"
         self.target = target  # human-readable target description
         self.project_id = project_id
         self.name = name  # specific file name, or None for project-wide/all
@@ -154,13 +154,15 @@ class JobManager:
         return False
 
     def blocks_document_delete(self, project_id, name):
-        """True if a queued or running ingest job targets this approved document (exact name or a
-        project-wide/library-wide job), so deleting it now would be undone by the job's upsert."""
-        for job in self._active_jobs("ingest"):
-            if job.project_id is not None and job.project_id != project_id:
-                continue
-            if job.name is None or job.name == name:
-                return True
+        """True if a queued or running ingest or index_pages job targets this approved document
+        (exact name or a project-wide/library-wide job), so deleting it now would be undone by
+        the job's upsert (or leave page points pointing at a deleted source)."""
+        for job_type in ("ingest", "index_pages"):
+            for job in self._active_jobs(job_type):
+                if job.project_id is not None and job.project_id != project_id:
+                    continue
+                if job.name is None or job.name == name:
+                    return True
         return False
 
     def _prune_locked(self):

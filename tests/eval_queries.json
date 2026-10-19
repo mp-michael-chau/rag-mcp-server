@@ -1,0 +1,16 @@
+{
+  "_README": "Ground-truth queries for eval_visual.py / eval_text_embedder.py. One object per query: query (free text), source (exact filename as in pdf_inbox), page (1-based, omit for text targets), kind ('visual' = drawing/table/figure target, 'text' = prose target). Aim for 20-30 entries weighted toward 'visual'. Delete this _README key when filling in real queries.",
+  "queries": [
+    {
+      "query": "EXAMPLE - replace with a real drawing/table query",
+      "source": "02.Particular Specification.pdf",
+      "page": 31,
+      "kind": "visual"
+    },
+    {
+      "query": "EXAMPLE - replace with a real prose query",
+      "source": "02.Particular Specification.pdf",
+      "kind": "text"
+    }
+  ]
+}

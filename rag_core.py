@@ -12,9 +12,11 @@ root-level files = the virtual "global" scope; first-level subfolder names are
 project_ids (dotfolders skipped, no deeper recursion).
 """
 
+import base64
 import json
 import os
 import re
+import shutil
 import urllib.error
 import urllib.request
 import uuid
@@ -53,8 +55,32 @@ CONVERT_BATCH_PAGES = 40  # Pages per conversion batch (limits memory usage; res
 EMBED_BATCH = 32  # Texts per Ollama /api/embed call
 UPSERT_BATCH = 100  # Points per Qdrant upsert call (32MB single-request payload limit)
 VL_MODEL = os.getenv("VL_MODEL", "qwen3.8:27b-mlx")  # Ollama vision-language model describing images found in PDFs
-VL_PROMPT = "Describe this image:"  # Prompt sent with each image; English prompt → English descriptions (matches the mostly-English corpus)
+# Structured caption prompt: extracts chart/diagram type, axes, labels and readable numbers so
+# figures become findable via text. English prompt → English descriptions (matches the mostly-English corpus).
+VL_PROMPT = (
+    "Describe this image from an engineering/tender document for retrieval purposes, in one compact paragraph: "
+    "(1) what kind of visual it is (drawing, chart, graph, table, diagram, flowchart, photo, map...); "
+    "(2) its title or subject; "
+    "(3) for charts/graphs/tables: the axes, columns, series, units, and any readable numbers, values or ranges; "
+    "(4) for drawings/diagrams: the main components, symbols and how they connect; "
+    "(5) any labels, legends, keys or annotations visible. "
+    "State only what is actually visible; do not guess or interpret beyond the image."
+)
 VL_TIMEOUT = 300  # Seconds per VL request; a 27B model can take tens of seconds per image
+
+# 2b. Page-image visual retrieval (EmbeddingGemma 2 multimodal, "EG2", 768d MRL)
+# Ollama /api/embed accepts images only in object input form: each entry carries its own
+# {"image": <b64>} (T0 preflight: a top-level "images" field is silently ignored by the embed
+# endpoints — vectors come back text-only — and an empty-string input is rejected).
+PAGES_DIR = str(BASE_DIR / "pages")  # Rendered page PNGs: pages/{project_id}/{stem}/page-{nnnn}.png
+PAGE_COLLECTION_NAME = "kilo-projects-pages"
+PAGE_EMBED_MODEL = os.getenv("PAGE_EMBED_MODEL", "embeddinggemma-2")
+PAGE_EMBED_BATCH = 4  # Images per Ollama /api/embed call (each page PNG is a multi-hundred-KB base64 JSON entry)
+PAGE_EMBED_TIMEOUT = 300  # Seconds per page-embed call (vision encoding of a batch is slower than text)
+PAGE_RENDER_SCALE = 2.0  # pypdfium2 render scale (matches Docling images_scale; keeps small text readable for the vision encoder)
+PAGE_QUERY_INSTRUCTION = "task: given a web page query, retrieve the relevant page\nquery: "  # EG2 query-side task prefix
+PAGE_RESULTS = 6  # Page matches returned per search (fused order; scored by raw page cosine)
+ENABLE_VISUAL = os.getenv("ENABLE_VISUAL", "1") != "0"  # default on; search degrades to text-only when off
 
 # Sidecar/hidden-file suffixes produced by this pipeline (importers: api/app.py listings/uploads/deletes).
 # ".flatten-tmp" is produced by flatten_md_tables.flatten_file's atomic write.
@@ -155,6 +181,45 @@ def embed_texts(texts):
         ) from e
 
 
+def embed_page_images(images_b64):
+    """Embed base64 page PNGs with the multimodal model (object input form, one image per
+    entry — see the T0 note at PAGE_EMBED_MODEL). Raises RuntimeError when Ollama is
+    unreachable, mirroring embed_texts."""
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/embed",
+        data=json.dumps({"model": PAGE_EMBED_MODEL, "input": [{"image": b} for b in images_b64]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PAGE_EMBED_TIMEOUT) as resp:
+            return json.load(resp)["embeddings"]
+    except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"Cannot embed page images with Ollama ({OLLAMA_HOST}, model {PAGE_EMBED_MODEL}): {e}. "
+            f"Please make sure Ollama is running (e.g. run `ollama serve`) and the model is downloaded "
+            f"(`ollama pull {PAGE_EMBED_MODEL}`), then retry."
+        ) from e
+
+
+def embed_page_query(query):
+    """Embed a text query for page-image retrieval (EG2 retrieval task prefix on the query side;
+    the page side embeds images alone). Raises RuntimeError when Ollama is unreachable."""
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/embed",
+        data=json.dumps({"model": PAGE_EMBED_MODEL, "input": [PAGE_QUERY_INSTRUCTION + query]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)["embeddings"][0]
+    except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"Cannot embed the page query with Ollama ({OLLAMA_HOST}, model {PAGE_EMBED_MODEL}): {e}. "
+            f"Please make sure Ollama is running (e.g. run `ollama serve`) and the model is downloaded "
+            f"(`ollama pull {PAGE_EMBED_MODEL}`), then retry."
+        ) from e
+
+
 def ensure_collection():
     """Create the collection (dimension probed from the actual Ollama model output)
     + keyword payload indexes (idempotent): project_id, and the ref-ID arrays
@@ -174,6 +239,44 @@ def ensure_collection():
             pass
 
 
+def embed_eg2_texts(texts):
+    """Embed plain texts with the page model's text tower (eval tooling: EG2-vs-bge-m3
+    offline comparison; the production text pipeline stays on bge-m3)."""
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/embed",
+        data=json.dumps({"model": PAGE_EMBED_MODEL, "input": texts}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.load(resp)["embeddings"]
+    except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"Cannot embed texts with Ollama ({OLLAMA_HOST}, model {PAGE_EMBED_MODEL}): {e}. "
+            f"Please make sure Ollama is running (e.g. run `ollama serve`) and the model is downloaded "
+            f"(`ollama pull {PAGE_EMBED_MODEL}`), then retry."
+        ) from e
+
+
+def ensure_page_collection():
+    """Create the page collection (dimension probed from the actual model output — EG2 emits
+    768, but a server-side `dimensions` option could truncate it, so it is never hardcoded)
+    + project_id/source keyword indexes (idempotent), mirroring ensure_collection."""
+    if not qdrant.collection_exists(PAGE_COLLECTION_NAME):
+        qdrant.create_collection(
+            collection_name=PAGE_COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=len(embed_page_query("dimension probe")),
+                distance=Distance.COSINE
+            )
+        )
+    for field in ("project_id", "source"):
+        try:
+            qdrant.create_payload_index(PAGE_COLLECTION_NAME, field_name=field, field_schema="keyword")
+        except Exception:
+            pass
+
+
 def delete_points(project_id=None, source=None):
     """Delete Qdrant points by payload filter (project_id and/or source filename)."""
     must = []
@@ -182,6 +285,20 @@ def delete_points(project_id=None, source=None):
     if source is not None:
         must.append(FieldCondition(key="source", match=MatchValue(value=source)))
     qdrant.delete(collection_name=COLLECTION_NAME, points_selector=Filter(must=must))
+
+
+def delete_points_pages(project_id=None, source=None):
+    """Delete page-collection points by payload filter (mirrors delete_points). No-op when the
+    page collection doesn't exist yet — nothing has been indexed, so there is nothing to delete
+    (and delete_points-style hard failures here would break document deletes on fresh stacks)."""
+    if not qdrant.collection_exists(PAGE_COLLECTION_NAME):
+        return
+    must = []
+    if project_id is not None:
+        must.append(FieldCondition(key="project_id", match=MatchValue(value=project_id)))
+    if source is not None:
+        must.append(FieldCondition(key="source", match=MatchValue(value=source)))
+    qdrant.delete(collection_name=PAGE_COLLECTION_NAME, points_selector=Filter(must=must))
 
 
 # 6. PDF → Markdown conversion (Docling, resumable)
@@ -425,6 +542,51 @@ def convert_sheets_inbox(progress_cb=None):
     print(f"Done. Review/edit the Markdown in {MD_REVIEW_DIR}/, then move the finalized .md files into {DOCS_DIR}/ and run ingest_docs.py.")
 
 
+# 6c. Page rendering (visual-retrieval input; pypdfium2, not Docling — imports stay cheap and
+#     search/ingest never pay for the converter)
+
+def pages_png_dir(project_id, stem):
+    """Directory holding one document's rendered page PNGs: pages/{project_id}/{stem}/."""
+    return os.path.join(PAGES_DIR, project_id, stem)
+
+
+def page_png_relpath(project_id, stem, page_number):
+    """Page PNG path relative to PAGES_DIR — the value stored in Qdrant payloads and served
+    by the API's page-image endpoint."""
+    return f"{project_id}/{stem}/page-{page_number:04d}.png"
+
+
+def delete_page_pngs(project_id, filename=None):
+    """Remove rendered page PNGs — one document's dir when filename is given, the whole
+    project's pages/ subdir otherwise. Never raises (absent targets are fine)."""
+    target = pages_png_dir(project_id, os.path.splitext(filename)[0]) if filename else os.path.join(PAGES_DIR, project_id)
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def render_pdf_pages(pdf_path, project_id, filename):
+    """Render every page of pdf_path to pages/{project_id}/{stem}/page-{nnnn}.png at
+    PAGE_RENDER_SCALE. The output dir is recreated from scratch, so pages of a shrunk or
+    replaced source never survive a rerun. Returns the PNG file paths in page order."""
+    stem = os.path.splitext(filename)[0]
+    out_dir = pages_png_dir(project_id, stem)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        paths = []
+        for i in range(len(pdf)):
+            pil = pdf[i].render(scale=PAGE_RENDER_SCALE).to_pil()
+            png_path = os.path.join(out_dir, f"page-{i + 1:04d}.png")
+            pil.convert("RGB").save(png_path, format="PNG")
+            paths.append(png_path)
+        return paths
+    finally:
+        pdf.close()
+
+
 # 7. Text chunking: Parent-Child (Small-to-Big) architecture
 #    Parent = complete large section (stored in each Child's payload["text"] and returned directly at retrieval time, preserving full context)
 #    Child  = small chunk (only Children are vectorized, for precise semantic matching)
@@ -598,6 +760,95 @@ def ingest_all(progress_cb=None):
         print("No ingestible documents found.")
 
 
+# 8b. Page indexing (visual retrieval: EG2 page-as-image embeddings)
+
+def index_pages_file(project_id, filename, progress_cb=None):
+    """Index one approved PDF's pages as images: render → EG2 embed → upsert into the page
+    collection. Mirrors ingest_file's safety order: the human-approval gate (finalized md in
+    my_shared_docs) comes first, embedding runs before any deletion, and this file's previous
+    page points are deleted only right before upsert — an embedder failure never destroys
+    existing index state. Point IDs are deterministic (uuid5 "{project_id}:{filename}:page{n}"),
+    matching the text-point scheme, so reruns are idempotent.
+    progress_cb(done_pages, total_pages) fires per embed batch.
+    Returns {"status": indexed|skipped, "pages": int, "message": str}."""
+    if not filename.lower().endswith(".pdf"):
+        return {"status": "skipped", "pages": 0, "message": f"{project_id}/{filename}: not a PDF; no page images to index"}
+
+    md_path = finalized_md_path(project_id, filename)  # approval gate: only reviewed documents get page-indexed
+    if md_path is None:
+        return {"status": "skipped", "pages": 0,
+                "message": f"{project_id}/{filename}: approved md not found in {DOCS_DIR}; approve the conversion first"}
+
+    pdf_path = os.path.join(project_dir(PDF_INBOX_DIR, project_id), filename)
+    if not os.path.isfile(pdf_path):
+        return {"status": "skipped", "pages": 0,
+                "message": f"{project_id}/{filename}: source PDF not found in pdf_inbox; cannot render pages"}
+
+    print(f"Indexing pages: {project_id}/{filename}")
+    png_paths = render_pdf_pages(pdf_path, project_id, filename)
+    stem = os.path.splitext(filename)[0]
+
+    points = []
+    for start in range(0, len(png_paths), PAGE_EMBED_BATCH):
+        batch = png_paths[start:start + PAGE_EMBED_BATCH]
+        images_b64 = []
+        for png_path in batch:
+            with open(png_path, "rb") as f:
+                images_b64.append(base64.b64encode(f.read()).decode("ascii"))
+        vectors = embed_page_images(images_b64)
+        for png_path, vector in zip(batch, vectors):
+            page_number = int(os.path.splitext(os.path.basename(png_path))[0].rsplit("-", 1)[1])
+            points.append(PointStruct(
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{project_id}:{filename}:page{page_number}")),
+                vector=vector,
+                payload={
+                    "project_id": project_id,
+                    "source": filename,
+                    "page_number": page_number,
+                    "page_image": page_png_relpath(project_id, stem, page_number),
+                },
+            ))
+        if progress_cb:
+            progress_cb(min(start + PAGE_EMBED_BATCH, len(png_paths)), len(png_paths))
+
+    # Guard against vanish-during-embedding (same rationale as ingest_file: never write points
+    # whose source or approval was removed while the embedder ran).
+    if not (os.path.isfile(pdf_path) and os.path.exists(md_path)):
+        msg = f"Warning: {project_id}/{filename} (or its approved md) disappeared during page indexing; aborted before upsert"
+        print(msg)
+        return {"status": "skipped", "pages": 0, "message": msg}
+
+    # Delete this file's previous page points only now, after embedding succeeded.
+    delete_points_pages(project_id=project_id, source=filename)
+
+    print(f"Upserting {len(points)} page vectors into {PAGE_COLLECTION_NAME}...")
+    for start in range(0, len(points), UPSERT_BATCH):
+        qdrant.upsert(
+            collection_name=PAGE_COLLECTION_NAME,
+            points=points[start:start + UPSERT_BATCH]
+        )
+        print(f"  Uploaded {min(start + UPSERT_BATCH, len(points))}/{len(points)} pages")
+    print("Done!")
+    return {"status": "indexed", "pages": len(points),
+            "message": f"Indexed {project_id}/{filename} ({len(points)} pages)"}
+
+
+def index_pages_all(progress_cb=None):
+    """CLI entry: index page images for every approved PDF (an inbox PDF whose finalized md
+    already lives in my_shared_docs)."""
+    indexed = 0
+    for project_id, filename, filepath in scan_doc_sources(PDF_INBOX_DIR):
+        if not filename.lower().endswith(".pdf"):
+            continue
+        if finalized_md_path(project_id, filename) is None:
+            continue
+        result = index_pages_file(project_id, filename, progress_cb=progress_cb)
+        if result["status"] == "indexed":
+            indexed += 1
+    if not indexed:
+        print("No approved PDFs to index (a PDF counts once its md is approved into my_shared_docs).")
+
+
 # 9. Search (Parent-Child Small-to-Big retrieval + section-ID exact matching)
 
 def _sub_in_text(text, sub):
@@ -615,6 +866,60 @@ def _hit_from_payload(payload, score):
     }
 
 
+# Reciprocal Rank Fusion constant (standard k=60) for the text × page-image hybrid ranking.
+RRF_K = 60
+
+
+def _visual_page_hits(query, scope, vector_pool, limit, enabled):
+    """Page-image half of hybrid retrieval. Returns (pages, source_page_rank, note):
+    pages  = fused-order page hits [{project_id, source, page_number, score, page_image}] —
+             score is the raw page cosine; the ORDER is RRF(page rank, best text rank of the
+             page's source within vector_pool), so pages from documents that also match text
+             rank above equally-similar pages of text-unrelated documents.
+    source_page_rank = best page rank per source, feeding the text-fill fusion in search_full.
+    note  = user-facing degradation note, or None.
+    Never raises: missing page collection = nothing indexed yet (silent), embedder/Qdrant
+    failure = text-only fallback with a note."""
+    if not enabled:
+        return [], {}, None
+    note = None
+    try:
+        if not qdrant.collection_exists(PAGE_COLLECTION_NAME):
+            return [], {}, None  # no pages indexed yet — not an error
+        query_vector = embed_page_query(query)
+        page_results = qdrant.query_points(
+            collection_name=PAGE_COLLECTION_NAME, query=query_vector,
+            query_filter=Filter(must=[scope]), limit=max(limit * 4, 24),
+        ).points
+    except Exception as e:
+        return [], {}, f"[visual search unavailable ({e}); showing text-only results]"
+
+    source_text_rank = {}
+    for rank, hit in enumerate(vector_pool, 1):
+        src = hit.get("source")
+        if src is not None and src not in source_text_rank:
+            source_text_rank[src] = rank
+
+    fused, source_page_rank = [], {}
+    for rank, res in enumerate(page_results, 1):
+        payload = res.payload
+        src = payload.get("source")
+        if src is not None and src not in source_page_rank:
+            source_page_rank[src] = rank
+        rrf = 1.0 / (RRF_K + rank)
+        if src in source_text_rank:
+            rrf += 1.0 / (RRF_K + source_text_rank[src])
+        fused.append((rrf, {
+            "project_id": payload.get("project_id"),
+            "source": src,
+            "page_number": payload.get("page_number"),
+            "score": res.score,
+            "page_image": payload.get("page_image"),
+        }))
+    fused.sort(key=lambda pair: -pair[0])  # stable: ties keep page-cosine order
+    return [entry for _, entry in fused[:limit]], source_page_rank, note
+
+
 def _scroll_all(scroll_filter, limit_per_page=256, max_points=2048):
     """Scroll every point matching the filter (paginated); local corpus scale keeps this cheap."""
     points, offset = qdrant.scroll(
@@ -630,9 +935,10 @@ def _scroll_all(scroll_filter, limit_per_page=256, max_points=2048):
     return points
 
 
-def search_full(query, project_id=None, target_parents=3, ref=None):
+def search_full(query, project_id=None, target_parents=3, ref=None, include_pages=None):
     """Search with section-ID reinforcement. Returns
-    {"hits": [...], "notes": [str], "referenced_by": {ref_id: {source: count}}}.
+    {"hits": [...], "notes": [str], "referenced_by": {ref_id: {source: count}},
+    "pages": [{project_id, source, page_number, score, page_image}]}.
 
     hits is the same list of hit dicts as search() (one per deduplicated parent),
     where exact ref matches additionally carry "matched_refs": [ref_id, ...].
@@ -646,7 +952,14 @@ def search_full(query, project_id=None, target_parents=3, ref=None):
     parent_ref_ids → exact match (depth >= 3 clauses and alphanumeric IDs
     return their own parent; shallower section/schedule refs vector-rank
     children within the ref filter) → blend with plain vector results up to
-    target_parents → referenced-by. Zero exact hits → pure vector behavior.
+    target_parents → referenced_by. Zero exact hits → pure vector behavior.
+
+    Visual branch (include_pages=None → ENABLE_VISUAL env, default on): the
+    query is also embedded by the page model and matched against page images;
+    the vector-fill order of hits and the new pages list are then fused by RRF
+    per source. Exact ref hits always stay first and keep their payload/score
+    (fusion touches only vector-ranked fill); with the branch off, hits are
+    byte-identical to the text-only search and pages is [].
 
     When project_id is given, only that project is searched, automatically
     including global shared documents; when project_id is omitted, only global
@@ -741,9 +1054,12 @@ def search_full(query, project_id=None, target_parents=3, ref=None):
             if t.get("sub") and not sub_found:
                 notes.append(f"[sub-item ({t['sub']}) not found verbatim in {t['id']}; returning the section]")
 
-    # 4. Blend: exact hits first, then fill up to target_parents with plain
-    # vector results deduplicated against the exact hits
+    # 4. Blend: exact hits first, then fill up to target_parents with plain vector results
+    # deduplicated against the exact hits. Candidates are collected into vector_pool (pure
+    # text-vector order) so the visual branch can fuse the fill order below; with the visual
+    # branch off the pool order IS the final fill order (byte-identical to the text-only search).
     hits = exact_hits
+    vector_pool = []
     if len(hits) < target_parents:
         fetch_limit = target_parents * 5
         results = qdrant.query_points(
@@ -751,15 +1067,36 @@ def search_full(query, project_id=None, target_parents=3, ref=None):
             query_filter=Filter(must=[scope]), limit=fetch_limit,
         ).points
         for res in results:
-            if len(hits) >= target_parents:
-                break
             p_id = res.payload.get("parent_id") or str(res.id)
             if p_id in exact_parent_ids:
                 continue
             hit = _hit_from_payload(res.payload, res.score)
             hit["parent_id"] = p_id
             exact_parent_ids.add(p_id)
-            hits.append(hit)
+            vector_pool.append(hit)
+
+    # 4b. Visual branch: page-image retrieval, RRF-fused with the text ranking per source.
+    # Failures degrade to text-only (pages=[] + note); exact hits are never touched.
+    pages, source_page_rank, visual_note = _visual_page_hits(
+        query, scope, vector_pool, PAGE_RESULTS,
+        enabled=ENABLE_VISUAL if include_pages is None else bool(include_pages),
+    )
+    if visual_note:
+        notes.append(visual_note)
+
+    if len(hits) < target_parents:
+        def fill_rrf(text_rank, source):
+            score = 1.0 / (RRF_K + text_rank)
+            page_rank = source_page_rank.get(source)
+            if page_rank is not None:
+                score += 1.0 / (RRF_K + page_rank)
+            return score
+
+        ordered = sorted(
+            enumerate(vector_pool),
+            key=lambda item: -fill_rrf(item[0] + 1, item[1].get("source")),
+        )  # stable sort: equal fused scores keep text order; no page signal ⇒ pure text order
+        hits = hits + [hit for _, hit in ordered[:target_parents - len(hits)]]
 
     matched = {rid for h in exact_hits for rid in h.get("matched_refs", [])}
     for t in confirmed:
@@ -786,7 +1123,7 @@ def search_full(query, project_id=None, target_parents=3, ref=None):
         if counts:
             referenced_by[t["id"]] = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
-    return {"hits": hits, "notes": notes, "referenced_by": referenced_by}
+    return {"hits": hits, "notes": notes, "referenced_by": referenced_by, "pages": pages}
 
 
 def search(query, project_id=None, target_parents=3, ref=None):
